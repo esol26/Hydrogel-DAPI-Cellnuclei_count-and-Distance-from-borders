@@ -1,0 +1,1299 @@
+from __future__ import annotations
+
+import os
+import math
+import csv
+import re
+import traceback
+import threading
+import queue
+import time
+import heapq
+from dataclasses import dataclass
+from datetime import datetime
+from itertools import product
+
+import numpy as np
+import pandas as pd
+import tifffile as tiff
+import cv2
+
+from scipy import ndimage as ndi
+from skimage import filters, morphology, measure, segmentation
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+
+CALIBRATOR_VERSION = "2026-02-16_nuclei_calibrator_gui_app_v10_staged_prune_or_bruteforce_cache_log50"
+
+SUPPORTED_IMAGE_EXTS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
+
+TOP_N = 10
+COMBO_WARN_THRESHOLD = 200_000
+
+# Log update cadence
+LOG_EVERY_PARAMS = 50
+
+# Live flush behavior (time- and row-based)
+FLUSH_EVERY_ROWS = 200
+FLUSH_EVERY_SEC = 2.0
+
+# Staged pruning schedule (keep fractions)
+STAGE1_KEEP_FRAC = 0.50
+STAGE2_KEEP_FRAC = 0.50
+STAGE3PLUS_KEEP_FRAC = 0.20  # drop 80%
+
+MIN_SURVIVORS = 100
+
+# Brute force outputs
+WRITE_ALL_RESULTS_UP_TO = 100_000  # store all_results.csv only up to this many combos
+
+
+# -------------------- Image helpers --------------------
+def list_images(folder: str) -> list[str]:
+    out: list[str] = []
+    for fn in sorted(os.listdir(folder)):
+        ext = os.path.splitext(fn)[1].lower()
+        if ext in SUPPORTED_IMAGE_EXTS:
+            out.append(os.path.join(folder, fn))
+    return out
+
+
+def read_image_any(path: str) -> tuple[np.ndarray, str]:
+    """
+    Returns (image, source) where source is "tiff" or "cv2".
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext in [".tif", ".tiff"]:
+        return tiff.imread(path), "tiff"
+
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError(f"Could not read image: {path}")
+    return img, "cv2"
+
+
+def extract_dapi_channel(img: np.ndarray, source: str) -> np.ndarray:
+    """
+    Returns a 2D array used for segmentation.
+
+    - cv2 loads color as BGR -> DAPI typically in BLUE => channel 0
+    - tifffile often yields RGB for color -> BLUE => channel 2
+    """
+    if img.ndim == 2:
+        return img
+
+    if img.ndim == 3:
+        # HWC
+        if img.shape[-1] >= 3:
+            if source == "cv2":
+                return img[..., 0]  # BGR blue
+            return img[..., 2]      # RGB blue
+
+        # CHW
+        if img.shape[0] >= 3:
+            if source == "cv2":
+                return img[0, ...]
+            return img[2, ...]
+
+        return np.max(img, axis=0)
+
+    raise ValueError(f"Unsupported image shape: {img.shape}")
+
+
+def to_float01(img: np.ndarray) -> np.ndarray:
+    img = img.astype(np.float32, copy=False)
+    mn = float(np.nanmin(img))
+    mx = float(np.nanmax(img))
+    if mx <= mn:
+        return np.zeros_like(img, dtype=np.float32)
+    return (img - mn) / (mx - mn)
+
+
+def write_png(path: str, img: np.ndarray, png_compression: int) -> None:
+    comp = int(max(0, min(9, png_compression)))
+    ok = cv2.imwrite(path, img, [cv2.IMWRITE_PNG_COMPRESSION, comp])
+    if not ok:
+        raise ValueError(f"Could not write PNG: {path}")
+
+
+# -------------------- Segmentation --------------------
+def phansalkar_threshold(img01: np.ndarray, radius: int, k: float = 0.25, r: float = 0.5) -> np.ndarray:
+    if radius < 1:
+        raise ValueError("local_radius_px must be >= 1")
+
+    p = 2.0
+    q = 10.0
+    R = float(r)
+
+    size = 2 * radius + 1
+    m = ndi.uniform_filter(img01, size=size, mode="reflect")
+    m2 = ndi.uniform_filter(img01 * img01, size=size, mode="reflect")
+    s = np.sqrt(np.maximum(m2 - m * m, 0.0))
+
+    T = m * (1.0 + p * np.exp(-q * m) + float(k) * ((s / (R + 1e-12)) - 1.0))
+    return T
+
+
+def remove_small_objects_compat(mask: np.ndarray, min_size_px2: int) -> np.ndarray:
+    varnames = morphology.remove_small_objects.__code__.co_varnames
+    if "max_size" in varnames:
+        max_size = int(min_size_px2) - 1
+        if max_size < 0:
+            return mask
+        return morphology.remove_small_objects(mask, max_size=max_size)
+    return morphology.remove_small_objects(mask, min_size=int(min_size_px2))
+
+
+def make_nuclei_labels_from_img01(
+    img01: np.ndarray,
+    gaussian_sigma: float,
+    local_radius_px: int,
+    min_size_px2: int,
+    max_size_px2: int,
+    do_watershed: bool,
+    watershed_h_px: float,
+    exclude_edge: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    x = img01
+
+    if gaussian_sigma > 0:
+        x = filters.gaussian(x, sigma=float(gaussian_sigma), preserve_range=True).astype(np.float32)
+
+    T = phansalkar_threshold(x, radius=int(local_radius_px))
+    mask = x > T
+
+    mask = remove_small_objects_compat(mask, int(min_size_px2))
+    mask = ndi.binary_fill_holes(mask)
+
+    if do_watershed:
+        dist = ndi.distance_transform_edt(mask)
+        h = float(watershed_h_px)
+
+        if h <= 0:
+            labels = measure.label(mask)
+        else:
+            maxima = morphology.h_maxima(dist, h=h)
+            markers = measure.label(maxima)
+            if int(markers.max()) == 0:
+                markers = measure.label(mask)
+            labels = segmentation.watershed(-dist, markers, mask=mask)
+    else:
+        labels = measure.label(mask)
+
+    if exclude_edge:
+        labels = segmentation.clear_border(labels)
+
+    out = np.zeros_like(labels, dtype=np.int32)
+    new_id = 1
+    for p in measure.regionprops(labels):
+        if p.area < int(min_size_px2) or p.area > int(max_size_px2):
+            continue
+        out[labels == p.label] = new_id
+        new_id += 1
+
+    return out, mask
+
+
+# -------------------- Parameter grid --------------------
+PARAM_TYPES = {
+    "gaussian_sigma": "float",
+    "watershed_h_px": "float",
+    "local_radius_px": "int",
+    "min_size_px2": "int",
+    "max_size_px2": "int",
+    "do_watershed": "bool",
+    "exclude_edge": "bool",
+}
+REQUIRED_PARAMS = list(PARAM_TYPES.keys())
+
+
+def parse_range_csv(csv_path: str) -> dict[str, dict]:
+    df = pd.read_csv(csv_path)
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    expected = ["parameter", "min", "max", "step"]
+    for c in expected:
+        if c not in df.columns:
+            raise ValueError(f"Parameter CSV missing column '{c}'. Expected columns: {expected}")
+
+    out: dict[str, dict] = {}
+    for _, r in df.iterrows():
+        p = str(r["parameter"]).strip()
+        if p == "" or p.lower().startswith("#"):
+            continue
+        if p not in PARAM_TYPES:
+            continue
+        out[p] = {"min": float(r["min"]), "max": float(r["max"]), "step": float(r["step"])}
+
+    missing = [p for p in REQUIRED_PARAMS if p not in out]
+    if missing:
+        raise ValueError(f"Parameter CSV missing required parameters: {missing}")
+    return out
+
+
+def values_from_range(p: str, rmin: float, rmax: float, step: float) -> list:
+    ptype = PARAM_TYPES[p]
+
+    if ptype == "bool":
+        if rmin <= 0 <= rmax and rmin <= 1 <= rmax:
+            return [False, True]
+        return [bool(round(rmax))]
+
+    if step <= 0:
+        raise ValueError(f"Step must be > 0 for parameter '{p}'")
+
+    n = int(math.floor((rmax - rmin) / step + 1e-9)) + 1
+    vals = [rmin + i * step for i in range(n)]
+    vals = [v for v in vals if v <= rmax + 1e-9]
+
+    if ptype == "int":
+        vals_int = sorted(set(int(round(v)) for v in vals))
+        if p == "local_radius_px":
+            vals_int = [v for v in vals_int if v >= 1]
+        if p in ("min_size_px2", "max_size_px2"):
+            vals_int = [v for v in vals_int if v >= 1]
+        return vals_int
+
+    return [float(v) for v in vals]
+
+
+def build_param_grid(ranges: dict[str, dict]) -> tuple[list[str], list[list]]:
+    names = REQUIRED_PARAMS[:]
+    all_values = []
+    for p in names:
+        r = ranges[p]
+        vals = values_from_range(p, r["min"], r["max"], r["step"])
+        if len(vals) == 0:
+            raise ValueError(f"No values produced for '{p}'. Check min/max/step.")
+        all_values.append(vals)
+    return names, all_values
+
+
+def combos_total_from_all_values(all_values: list[list]) -> int:
+    total = 1
+    for vals in all_values:
+        total *= len(vals)
+    return int(total)
+
+
+def params_from_combo(names: list[str], combo: tuple) -> dict:
+    d = dict(zip(names, combo))
+
+    d["gaussian_sigma"] = float(d["gaussian_sigma"])
+    d["watershed_h_px"] = float(d["watershed_h_px"])
+    d["local_radius_px"] = int(d["local_radius_px"])
+    d["min_size_px2"] = int(d["min_size_px2"])
+    d["max_size_px2"] = int(d["max_size_px2"])
+    d["do_watershed"] = bool(d["do_watershed"])
+    d["exclude_edge"] = bool(d["exclude_edge"])
+
+    if d["local_radius_px"] < 1:
+        return {}
+    if d["min_size_px2"] < 1 or d["max_size_px2"] < 1:
+        return {}
+    if d["max_size_px2"] < d["min_size_px2"]:
+        return {}
+    return d
+
+
+# -------------------- Helpers for per-image column naming --------------------
+def sanitize_col_token(name: str) -> str:
+    s = os.path.splitext(os.path.basename(name))[0]
+    s = re.sub(r"[^A-Za-z0-9_]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    if s == "":
+        s = "image"
+    return s
+
+
+def unique_tokens(basenames: list[str]) -> dict[str, str]:
+    used: set[str] = set()
+    out: dict[str, str] = {}
+    for bn in basenames:
+        base = sanitize_col_token(bn)
+        tok = base
+        i = 2
+        while tok in used:
+            tok = f"{base}_{i}"
+            i += 1
+        used.add(tok)
+        out[bn] = tok
+    return out
+
+
+# -------------------- Stage schedule + image order --------------------
+def keep_fraction_for_stage(stage_idx: int) -> float:
+    if stage_idx == 1:
+        return float(STAGE1_KEEP_FRAC)
+    if stage_idx == 2:
+        return float(STAGE2_KEEP_FRAC)
+    return float(STAGE3PLUS_KEEP_FRAC)
+
+
+def order_images_by_gt_zigzag(images: list[str], gt_map: dict[str, int]) -> list[str]:
+    """
+    Deterministic "diverse early" ordering:
+    sort by GT then take: median, low, high, 2nd low, 2nd high, ...
+    """
+    rows = []
+    for p in images:
+        bn = os.path.basename(p)
+        rows.append((int(gt_map[bn]), bn, p))
+    rows.sort(key=lambda t: (t[0], t[1]))
+    ps = [t[2] for t in rows]
+    if len(ps) <= 2:
+        return ps
+
+    mid = len(ps) // 2
+    out = [ps[mid]]
+    used = {mid}
+    lo, hi = 0, len(ps) - 1
+    toggle = True
+
+    while len(out) < len(ps):
+        if toggle:
+            if lo not in used:
+                out.append(ps[lo])
+                used.add(lo)
+            lo += 1
+        else:
+            if hi not in used:
+                out.append(ps[hi])
+                used.add(hi)
+            hi -= 1
+        toggle = not toggle
+
+        if lo > hi and len(out) < len(ps):
+            for i in range(len(ps)):
+                if i not in used:
+                    out.append(ps[i])
+                    used.add(i)
+    return out
+
+
+# -------------------- Candidate bookkeeping --------------------
+@dataclass
+class Candidate:
+    uid: int
+    combo: tuple
+    abs_error_sum: int = 0
+    count_total: int = 0
+
+    def key(self) -> tuple[int, int]:
+        return (int(self.abs_error_sum), int(self.count_total))
+
+
+# -------------------- Visualizations --------------------
+def save_top_images_for_params(
+    images: list[str],
+    out_dir: str,
+    params: dict,
+    gt_map: dict[str, int],
+    img01_cache: dict[str, np.ndarray],
+    dapi_cache: dict[str, np.ndarray],
+    png_compression: int,
+    viz_downsample_factor: int,
+) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    ds = max(1, int(viz_downsample_factor))
+
+    per_image_rows = []
+
+    for path in images:
+        bn = os.path.basename(path)
+        base = os.path.splitext(bn)[0]
+
+        img01 = img01_cache[bn]
+        labels, mask = make_nuclei_labels_from_img01(
+            img01=img01,
+            gaussian_sigma=float(params["gaussian_sigma"]),
+            local_radius_px=int(params["local_radius_px"]),
+            min_size_px2=int(params["min_size_px2"]),
+            max_size_px2=int(params["max_size_px2"]),
+            do_watershed=bool(params["do_watershed"]),
+            watershed_h_px=float(params["watershed_h_px"]),
+            exclude_edge=bool(params["exclude_edge"]),
+        )
+
+        count = int(labels.max())
+        gt = int(gt_map[bn])
+        err = int(abs(count - gt))
+        per_image_rows.append({"filename": bn, "count": count, "ground_truth": gt, "abs_error": err})
+
+        dapi = dapi_cache[bn]
+        dapi01_ds = img01[::ds, ::ds]
+        dapi8 = (dapi01_ds * 255).astype(np.uint8)
+
+        mask_ds = mask[::ds, ::ds]
+        labels_ds = labels[::ds, ::ds]
+        overlay = cv2.cvtColor(dapi8, cv2.COLOR_GRAY2BGR)
+
+        props = measure.regionprops_table(labels_ds, properties=("centroid",))
+        if "centroid-0" in props:
+            ys = props["centroid-0"]
+            xs = props["centroid-1"]
+            for y, x in zip(ys, xs):
+                yy = int(round(float(y)))
+                xx = int(round(float(x)))
+                if 0 <= yy < overlay.shape[0] and 0 <= xx < overlay.shape[1]:
+                    cv2.circle(overlay, (xx, yy), 1, (255, 255, 255), -1, lineType=cv2.LINE_AA)
+
+        edges = segmentation.find_boundaries(labels_ds, mode="outer").astype(np.uint8) * 255
+
+        write_png(os.path.join(out_dir, f"{base}_nuclei_mask_ds{ds}.png"), (mask_ds.astype(np.uint8) * 255), png_compression)
+        write_png(os.path.join(out_dir, f"{base}_overlay_dots_ds{ds}.png"), overlay, png_compression)
+        write_png(os.path.join(out_dir, f"{base}_label_edges_ds{ds}.png"), edges, png_compression)
+
+        with open(os.path.join(out_dir, f"{base}_count.txt"), "w", encoding="utf-8") as f:
+            f.write(f"count={count}\n")
+            f.write(f"ground_truth={gt}\n")
+            f.write(f"abs_error={err}\n")
+
+    pd.DataFrame(per_image_rows).sort_values(["abs_error", "filename"]).to_csv(
+        os.path.join(out_dir, "per_image_counts.csv"),
+        index=False,
+    )
+
+
+# -------------------- GUI App --------------------
+class CalibratorApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("DAPI nuclei calibrator")
+        self.root.geometry("1020x780")
+
+        self.msg_q: queue.Queue = queue.Queue()
+        self.worker: threading.Thread | None = None
+        self.stop_event = threading.Event()
+
+        self.param_csv_var = tk.StringVar(value="")
+        self.img_folder_var = tk.StringVar(value="")
+        self.out_folder_var = tk.StringVar(value="")
+        self.png_comp_var = tk.IntVar(value=5)
+        self.downsample_var = tk.IntVar(value=4)
+
+        self.mode_var = tk.StringVar(value="Staged pruning (50/50 then 80%)")
+
+        self.image_paths: list[str] = []
+        self.gt_entries: dict[str, ttk.Entry] = {}
+
+        self._build_ui()
+        self._poll_queue()
+        self.log(f"CALIBRATOR_VERSION={CALIBRATOR_VERSION}")
+
+    def _build_ui(self) -> None:
+        outer = ttk.Frame(self.root, padding=10)
+        outer.pack(fill="both", expand=True)
+
+        sel = ttk.LabelFrame(outer, text="Inputs")
+        sel.pack(fill="x")
+
+        def row(parent, label, var, browse_cmd):
+            fr = ttk.Frame(parent)
+            fr.pack(fill="x", pady=4)
+            ttk.Label(fr, text=label, width=18).pack(side="left")
+            ent = ttk.Entry(fr, textvariable=var)
+            ent.pack(side="left", fill="x", expand=True, padx=6)
+            ttk.Button(fr, text="Browse…", command=browse_cmd).pack(side="left")
+            return fr
+
+        row(sel, "Parameter CSV:", self.param_csv_var, self.browse_param_csv)
+        row(sel, "Image folder:", self.img_folder_var, self.browse_img_folder)
+        row(sel, "Output folder:", self.out_folder_var, self.browse_out_folder)
+
+        opts = ttk.Frame(sel)
+        opts.pack(fill="x", pady=6)
+
+        ttk.Label(opts, text="Mode:").pack(side="left")
+        ttk.Combobox(
+            opts,
+            textvariable=self.mode_var,
+            values=["Staged pruning (50/50 then 80%)", "Brute force (full grid)"],
+            width=28,
+            state="readonly",
+        ).pack(side="left", padx=6)
+
+        ttk.Label(opts, text="PNG compression (0..9):").pack(side="left", padx=(20, 0))
+        ttk.Spinbox(opts, from_=0, to=9, textvariable=self.png_comp_var, width=5).pack(side="left", padx=6)
+
+        ttk.Label(opts, text="Downsample for saved PNGs:").pack(side="left", padx=(20, 0))
+        ttk.Spinbox(opts, from_=1, to=64, textvariable=self.downsample_var, width=6).pack(side="left", padx=6)
+
+        self.cancel_btn = ttk.Button(opts, text="Abort", command=self.abort, state="disabled")
+        self.cancel_btn.pack(side="right", padx=(6, 0))
+
+        self.start_btn = ttk.Button(opts, text="Start calibration", command=self.start)
+        self.start_btn.pack(side="right")
+
+        gt = ttk.LabelFrame(outer, text="Ground truth per image (enter counts)")
+        gt.pack(fill="both", expand=True, pady=(10, 8))
+
+        btns = ttk.Frame(gt)
+        btns.pack(fill="x", pady=4)
+
+        ttk.Button(btns, text="Fill all…", command=self.fill_all_gt).pack(side="left")
+        ttk.Button(btns, text="Load GT CSV…", command=self.load_gt_csv).pack(side="left", padx=6)
+        ttk.Button(btns, text="Save GT CSV…", command=self.save_gt_csv).pack(side="left", padx=6)
+        ttk.Label(btns, text="(Images populate after selecting Image folder)").pack(side="left", padx=10)
+
+        self.gt_canvas = tk.Canvas(gt, borderwidth=0, highlightthickness=0)
+        self.gt_scroll = ttk.Scrollbar(gt, orient="vertical", command=self.gt_canvas.yview)
+        self.gt_inner = ttk.Frame(self.gt_canvas)
+
+        self.gt_inner.bind("<Configure>", lambda e: self.gt_canvas.configure(scrollregion=self.gt_canvas.bbox("all")))
+        self.gt_canvas.create_window((0, 0), window=self.gt_inner, anchor="nw")
+        self.gt_canvas.configure(yscrollcommand=self.gt_scroll.set)
+
+        self.gt_canvas.pack(side="left", fill="both", expand=True)
+        self.gt_scroll.pack(side="right", fill="y")
+
+        hdr = ttk.Frame(self.gt_inner)
+        hdr.pack(fill="x", pady=(0, 4))
+        ttk.Label(hdr, text="Filename", width=70).pack(side="left")
+        ttk.Label(hdr, text="Ground truth", width=12).pack(side="left")
+
+        logf = ttk.LabelFrame(outer, text="Log")
+        logf.pack(fill="both", expand=False)
+
+        self.log_text = tk.Text(logf, height=10, wrap="word")
+        self.log_text.pack(fill="both", expand=True)
+
+        self.pb = ttk.Progressbar(outer, mode="determinate")
+        self.pb.pack(fill="x", pady=(8, 0))
+
+    def log(self, s: str) -> None:
+        self.log_text.insert("end", s + "\n")
+        self.log_text.see("end")
+
+    def browse_param_csv(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select parameter-range CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            parent=self.root,
+        )
+        if path:
+            self.param_csv_var.set(path)
+
+    def browse_img_folder(self) -> None:
+        folder = filedialog.askdirectory(title="Select folder containing images", parent=self.root)
+        if not folder:
+            return
+        self.img_folder_var.set(folder)
+        self.populate_images(folder)
+
+    def browse_out_folder(self) -> None:
+        folder = filedialog.askdirectory(title="Select output folder", parent=self.root)
+        if folder:
+            self.out_folder_var.set(folder)
+
+    def populate_images(self, folder: str) -> None:
+        children = self.gt_inner.winfo_children()
+        for w in children[1:]:
+            w.destroy()
+
+        self.gt_entries.clear()
+        self.image_paths = list_images(folder)
+
+        self.log(f"Found {len(self.image_paths)} images in folder.")
+        if len(self.image_paths) == 0:
+            messagebox.showerror("No images", "No supported images found in the selected folder.", parent=self.root)
+            return
+
+        for p in self.image_paths:
+            bn = os.path.basename(p)
+            row = ttk.Frame(self.gt_inner)
+            row.pack(fill="x", pady=2)
+            ttk.Label(row, text=bn, width=70).pack(side="left")
+            e = ttk.Entry(row, width=12)
+            e.pack(side="left")
+            self.gt_entries[bn] = e
+
+    def fill_all_gt(self) -> None:
+        if not self.gt_entries:
+            messagebox.showinfo("No images", "Select an image folder first.", parent=self.root)
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Fill all ground truth")
+        win.geometry("320x120")
+        win.transient(self.root)
+
+        v = tk.StringVar(value="")
+        ttk.Label(win, text="Value to set for all images:").pack(pady=8)
+        ent = ttk.Entry(win, textvariable=v)
+        ent.pack()
+        ent.focus_set()
+
+        def apply():
+            s = v.get().strip()
+            try:
+                n = int(s)
+                if n < 0:
+                    raise ValueError("Must be >= 0")
+            except Exception:
+                messagebox.showerror("Invalid", "Please enter a non-negative integer.", parent=win)
+                return
+            for e in self.gt_entries.values():
+                e.delete(0, "end")
+                e.insert(0, str(n))
+            win.destroy()
+
+        ttk.Button(win, text="OK", command=apply).pack(pady=10)
+
+    def load_gt_csv(self) -> None:
+        if not self.gt_entries:
+            messagebox.showinfo("No images", "Select an image folder first.", parent=self.root)
+            return
+        path = filedialog.askopenfilename(
+            title="Load ground truth CSV (filename,ground_truth)",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            parent=self.root,
+        )
+        if not path:
+            return
+        try:
+            df = pd.read_csv(path)
+            df.columns = [c.strip().lower() for c in df.columns]
+            if "filename" not in df.columns or "ground_truth" not in df.columns:
+                raise ValueError("CSV must have columns: filename,ground_truth")
+            m = {str(r["filename"]).strip(): int(r["ground_truth"]) for _, r in df.iterrows()}
+            n_set = 0
+            for bn, e in self.gt_entries.items():
+                if bn in m:
+                    e.delete(0, "end")
+                    e.insert(0, str(int(m[bn])))
+                    n_set += 1
+            self.log(f"Loaded GT CSV: set {n_set} values.")
+        except Exception as ex:
+            messagebox.showerror("CSV error", str(ex), parent=self.root)
+
+    def save_gt_csv(self) -> None:
+        if not self.gt_entries:
+            messagebox.showinfo("No images", "Select an image folder first.", parent=self.root)
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save ground truth CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")],
+            parent=self.root,
+        )
+        if not path:
+            return
+        rows = []
+        for bn, e in self.gt_entries.items():
+            s = e.get().strip()
+            if s == "":
+                continue
+            try:
+                n = int(s)
+                if n < 0:
+                    continue
+                rows.append({"filename": bn, "ground_truth": n})
+            except Exception:
+                continue
+        pd.DataFrame(rows).to_csv(path, index=False)
+        self.log(f"Saved GT CSV: {path}")
+
+    def collect_ground_truth(self) -> dict[str, int]:
+        gt_map: dict[str, int] = {}
+        for bn, e in self.gt_entries.items():
+            s = e.get().strip()
+            if s == "":
+                continue
+            n = int(s)
+            if n < 0:
+                raise ValueError(f"Negative ground truth for {bn}")
+            gt_map[bn] = n
+        return gt_map
+
+    def abort(self) -> None:
+        if self.worker is None or not self.worker.is_alive():
+            return
+        self.stop_event.set()
+        self.log("Abort requested... (will stop after current image/step)")
+        self.cancel_btn.config(state="disabled")
+
+    def start(self) -> None:
+        if self.worker is not None and self.worker.is_alive():
+            messagebox.showinfo("Running", "Calibration is already running.", parent=self.root)
+            return
+
+        param_csv = self.param_csv_var.get().strip()
+        img_folder = self.img_folder_var.get().strip()
+        out_folder = self.out_folder_var.get().strip()
+        mode = self.mode_var.get().strip()
+
+        if not param_csv or not os.path.isfile(param_csv):
+            messagebox.showerror("Missing", "Please select a valid parameter CSV.", parent=self.root)
+            return
+        if not img_folder or not os.path.isdir(img_folder):
+            messagebox.showerror("Missing", "Please select a valid image folder.", parent=self.root)
+            return
+        if not out_folder or not os.path.isdir(out_folder):
+            messagebox.showerror("Missing", "Please select a valid output folder.", parent=self.root)
+            return
+        if not self.image_paths:
+            messagebox.showerror("No images", "No images loaded. Select an image folder first.", parent=self.root)
+            return
+
+        try:
+            gt_map = self.collect_ground_truth()
+        except Exception as ex:
+            messagebox.showerror("Ground truth error", str(ex), parent=self.root)
+            return
+
+        if len(gt_map) == 0:
+            messagebox.showerror("Ground truth missing", "Enter at least one ground-truth value.", parent=self.root)
+            return
+
+        images_used = [p for p in self.image_paths if os.path.basename(p) in gt_map]
+        if len(images_used) == 0:
+            messagebox.showerror("No match", "None of the images have ground truth values.", parent=self.root)
+            return
+
+        try:
+            ranges = parse_range_csv(param_csv)
+            names, all_values = build_param_grid(ranges)
+        except Exception as ex:
+            messagebox.showerror("Parameter CSV error", str(ex), parent=self.root)
+            return
+
+        combos_total = combos_total_from_all_values(all_values)
+
+        msg = (
+            f"Mode: {mode}\n"
+            f"Images used: {len(images_used)}\n"
+            f"Parameter combinations: {combos_total}\n\n"
+        )
+        if mode.startswith("Staged"):
+            msg += (
+                f"Schedule:\n"
+                f"  Stage1 keep {int(STAGE1_KEEP_FRAC*100)}% (min {MIN_SURVIVORS})\n"
+                f"  Stage2 keep {int(STAGE2_KEEP_FRAC*100)}% (min {MIN_SURVIVORS})\n"
+                f"  Stage3+ keep {int(STAGE3PLUS_KEEP_FRAC*100)}% (min {MIN_SURVIVORS})\n"
+                f"  Log every {LOG_EVERY_PARAMS} parameter sets\n"
+            )
+        else:
+            if combos_total >= COMBO_WARN_THRESHOLD:
+                msg += f"WARNING: combos >= {COMBO_WARN_THRESHOLD} (may take long)\n"
+            msg += f"Log every {LOG_EVERY_PARAMS} parameter sets\n"
+
+        if not messagebox.askyesno("Confirm", msg + "\nStart calibration?", parent=self.root):
+            return
+
+        # Progress bar: a rough max (don’t overthink); we update anyway.
+        if mode.startswith("Brute"):
+            pb_max = combos_total
+        else:
+            pb_max = combos_total * len(images_used)
+        self.pb["value"] = 0
+        self.pb["maximum"] = max(1, int(pb_max))
+
+        self.log("Starting calibration...")
+        self.stop_event.clear()
+        self.start_btn.config(state="disabled")
+        self.cancel_btn.config(state="normal")
+
+        args = {
+            "param_csv": param_csv,
+            "img_folder": img_folder,
+            "out_folder": out_folder,
+            "mode": mode,
+            "images": images_used,
+            "gt_map": gt_map,
+            "names": names,
+            "all_values": all_values,
+            "combos_total": combos_total,
+            "png_comp": int(self.png_comp_var.get()),
+            "downsample": int(self.downsample_var.get()),
+        }
+
+        self.worker = threading.Thread(target=self._run_worker, args=(args,), daemon=True)
+        self.worker.start()
+
+    def _run_worker(self, args: dict) -> None:
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_root = os.path.join(args["out_folder"], f"calibration_{ts}")
+            os.makedirs(out_root, exist_ok=False)
+
+            mode = args["mode"]
+
+            run_info_path = os.path.join(out_root, "run_info.txt")
+            with open(run_info_path, "w", encoding="utf-8") as f:
+                f.write(f"CALIBRATOR_VERSION={CALIBRATOR_VERSION}\n")
+                f.write(f"mode={mode}\n")
+                f.write(f"param_csv={args['param_csv']}\n")
+                f.write(f"img_folder={args['img_folder']}\n")
+                f.write(f"n_images_used={len(args['images'])}\n")
+                f.write(f"combos_total={args['combos_total']}\n")
+                f.write(f"png_compression={args['png_comp']}\n")
+                f.write(f"viz_downsample_factor={args['downsample']}\n")
+                f.write(f"log_every_params={LOG_EVERY_PARAMS}\n")
+                f.write("NOTE: cv2 reads color images as BGR (blue channel index 0).\n")
+                if mode.startswith("Staged"):
+                    f.write(f"stage1_keep_frac={STAGE1_KEEP_FRAC}\n")
+                    f.write(f"stage2_keep_frac={STAGE2_KEEP_FRAC}\n")
+                    f.write(f"stage3plus_keep_frac={STAGE3PLUS_KEEP_FRAC}\n")
+                    f.write(f"min_survivors={MIN_SURVIVORS}\n")
+
+            # ---- Cache images (DAPI + float01) ----
+            self.msg_q.put(("log", "Caching images into memory (DAPI channel + float01)..."))
+            dapi_cache: dict[str, np.ndarray] = {}
+            img01_cache: dict[str, np.ndarray] = {}
+            for i, path in enumerate(args["images"], start=1):
+                if self.stop_event.is_set():
+                    self.msg_q.put(("aborted", out_root))
+                    return
+                bn = os.path.basename(path)
+                img, src = read_image_any(path)
+                dapi = extract_dapi_channel(img, src)
+                dapi_cache[bn] = dapi
+                img01_cache[bn] = to_float01(dapi)
+                if i % 2 == 0 or i == len(args["images"]):
+                    self.msg_q.put(("log", f"Cached {i}/{len(args['images'])} images"))
+
+            # ---- Common naming ----
+            names = args["names"]
+            all_values = args["all_values"]
+            combos_total = int(args["combos_total"])
+            basenames = [os.path.basename(p) for p in args["images"]]
+            token_map = unique_tokens(basenames)
+
+            # ---- Writers + flushing helpers ----
+            last_flush_t = time.time()
+
+            def should_flush(rows_written: int) -> bool:
+                nonlocal last_flush_t
+                now = time.time()
+                if (rows_written % FLUSH_EVERY_ROWS) == 0:
+                    last_flush_t = now
+                    return True
+                if (now - last_flush_t) >= FLUSH_EVERY_SEC:
+                    last_flush_t = now
+                    return True
+                return False
+
+            # -------------------- Mode A: Staged pruning --------------------
+            if mode.startswith("Staged"):
+                ordered_images = order_images_by_gt_zigzag(args["images"], args["gt_map"])
+                self.msg_q.put(("log", "Stage image order (each stage adds one new image; cumulative images used = stage index):"))
+                for i, p in enumerate(ordered_images[: min(12, len(ordered_images))], start=1):
+                    bn = os.path.basename(p)
+                    self.msg_q.put(("log", f"  Stage{i}: {bn} (GT={args['gt_map'][bn]})"))
+
+                live_long_path = os.path.join(out_root, "live_results_long.csv")
+                stage_survivors_path = os.path.join(out_root, "stage_survivors.csv")
+
+                # Build candidates list (valid combos only)
+                self.msg_q.put(("log", "Building candidate list..."))
+                candidates: list[Candidate] = []
+                uid = 1
+                for combo in product(*all_values):
+                    params = params_from_combo(names, combo)
+                    if not params:
+                        continue
+                    candidates.append(Candidate(uid=uid, combo=combo))
+                    uid += 1
+                if len(candidates) == 0:
+                    self.msg_q.put(("error", "No valid parameter combinations after constraints."))
+                    return
+                self.msg_q.put(("log", f"Valid candidates: {len(candidates)}"))
+
+                long_fieldnames = (
+                    ["stage", "candidate_id"]
+                    + names
+                    + ["filename", "ground_truth", "count", "abs_error", "abs_error_sum_sofar", "count_total_sofar"]
+                )
+                stage_fieldnames = (
+                    ["stage", "image_filename", "n_before", "n_after", "keep_fraction", "keep_n", "best_abs_error_sum", "cutoff_abs_error_sum"]
+                )
+
+                pb_value = 0
+                long_rows_written = 0
+
+                with open(live_long_path, "w", newline="", encoding="utf-8") as long_f, open(
+                    stage_survivors_path, "w", newline="", encoding="utf-8"
+                ) as stage_f:
+                    long_writer = csv.DictWriter(long_f, fieldnames=long_fieldnames)
+                    stage_writer = csv.DictWriter(stage_f, fieldnames=stage_fieldnames)
+                    long_writer.writeheader()
+                    stage_writer.writeheader()
+                    long_f.flush()
+                    stage_f.flush()
+
+                    for stage_idx, img_path in enumerate(ordered_images, start=1):
+                        if self.stop_event.is_set():
+                            self.msg_q.put(("aborted", out_root))
+                            return
+
+                        bn = os.path.basename(img_path)
+                        img01 = img01_cache[bn]
+                        gt = int(args["gt_map"][bn])
+
+                        n_before = len(candidates)
+                        keep_frac = keep_fraction_for_stage(stage_idx)
+
+                        keep_n = int(math.ceil(n_before * keep_frac))
+                        keep_n = max(MIN_SURVIVORS, keep_n)
+                        keep_n = min(n_before, keep_n)
+
+                        t0 = time.time()
+                        n_eval = 0
+
+                        for c in candidates:
+                            if self.stop_event.is_set():
+                                self.msg_q.put(("aborted", out_root))
+                                return
+
+                            params = params_from_combo(names, c.combo)
+                            if not params:
+                                continue
+
+                            labels, _ = make_nuclei_labels_from_img01(
+                                img01=img01,
+                                gaussian_sigma=float(params["gaussian_sigma"]),
+                                local_radius_px=int(params["local_radius_px"]),
+                                min_size_px2=int(params["min_size_px2"]),
+                                max_size_px2=int(params["max_size_px2"]),
+                                do_watershed=bool(params["do_watershed"]),
+                                watershed_h_px=float(params["watershed_h_px"]),
+                                exclude_edge=bool(params["exclude_edge"]),
+                            )
+                            cnt = int(labels.max())
+                            err = int(abs(cnt - gt))
+
+                            c.abs_error_sum += err
+                            c.count_total += cnt
+
+                            long_writer.writerow(
+                                {
+                                    "stage": int(stage_idx),
+                                    "candidate_id": int(c.uid),
+                                    **{k: params[k] for k in names},
+                                    "filename": bn,
+                                    "ground_truth": gt,
+                                    "count": cnt,
+                                    "abs_error": err,
+                                    "abs_error_sum_sofar": int(c.abs_error_sum),
+                                    "count_total_sofar": int(c.count_total),
+                                }
+                            )
+                            long_rows_written += 1
+                            n_eval += 1
+                            pb_value += 1
+
+                            if n_eval % LOG_EVERY_PARAMS == 0 or n_eval == n_before:
+                                elapsed = time.time() - t0
+                                rate = n_eval / max(elapsed, 1e-9)
+                                self.msg_q.put(
+                                    (
+                                        "log",
+                                        f"Stage {stage_idx}/{len(ordered_images)} ({bn}) | "
+                                        f"evaluated {n_eval}/{n_before} | {rate:.2f} params/s | keep {keep_n}/{n_before}",
+                                    )
+                                )
+                                self.msg_q.put(("progress", pb_value))
+
+                            if should_flush(long_rows_written):
+                                long_f.flush()
+                                stage_f.flush()
+
+                        # Prune by cumulative (abs_error_sum, count_total)
+                        candidates.sort(key=lambda x: x.key())
+                        best = int(candidates[0].abs_error_sum)
+                        cutoff = int(candidates[keep_n - 1].abs_error_sum) if keep_n - 1 < len(candidates) else int(candidates[-1].abs_error_sum)
+
+                        candidates = candidates[:keep_n]
+                        n_after = len(candidates)
+
+                        stage_writer.writerow(
+                            {
+                                "stage": int(stage_idx),
+                                "image_filename": bn,
+                                "n_before": int(n_before),
+                                "n_after": int(n_after),
+                                "keep_fraction": float(keep_frac),
+                                "keep_n": int(keep_n),
+                                "best_abs_error_sum": int(best),
+                                "cutoff_abs_error_sum": int(cutoff),
+                            }
+                        )
+                        long_f.flush()
+                        stage_f.flush()
+
+                        self.msg_q.put(
+                            (
+                                "log",
+                                f"Stage {stage_idx} finished. Kept {n_after}/{n_before} "
+                                f"({keep_frac*100:.0f}%, min={MIN_SURVIVORS}). Best abs_error_sum={best}. Cutoff={cutoff}.",
+                            )
+                        )
+
+                        if len(candidates) <= 1:
+                            self.msg_q.put(("log", "Only one candidate left; continuing stages would not change ranking. Stopping early."))
+                            break
+
+                # Finalists are remaining candidates (already scored cumulatively)
+                finalists = sorted(candidates, key=lambda x: x.key())
+                if len(finalists) == 0:
+                    self.msg_q.put(("error", "No candidates left after pruning."))
+                    return
+
+                finals_df = pd.DataFrame(
+                    [
+                        {
+                            **{k: params_from_combo(names, c.combo)[k] for k in names},
+                            "abs_error_sum": int(c.abs_error_sum),
+                            "count_total": int(c.count_total),
+                            "n_images": int(len(args["images"])),
+                            "candidate_id": int(c.uid),
+                        }
+                        for c in finalists
+                    ]
+                ).sort_values(["abs_error_sum", "count_total"], ascending=[True, True])
+
+                finals_df.to_csv(os.path.join(out_root, "finalists_results.csv"), index=False)
+                top_df = finals_df.head(TOP_N)
+                top_df.to_csv(os.path.join(out_root, f"top{TOP_N}_results.csv"), index=False)
+
+                # Visualize topN
+                for rank, row in enumerate(top_df.to_dict(orient="records"), start=1):
+                    if self.stop_event.is_set():
+                        self.msg_q.put(("aborted", out_root))
+                        return
+
+                    params = {k: row[k] for k in names}
+                    params["gaussian_sigma"] = float(params["gaussian_sigma"])
+                    params["watershed_h_px"] = float(params["watershed_h_px"])
+                    params["local_radius_px"] = int(params["local_radius_px"])
+                    params["min_size_px2"] = int(params["min_size_px2"])
+                    params["max_size_px2"] = int(params["max_size_px2"])
+                    params["do_watershed"] = bool(params["do_watershed"])
+                    params["exclude_edge"] = bool(params["exclude_edge"])
+
+                    sub = os.path.join(
+                        out_root,
+                        f"top{rank:02d}_absErrSum{int(row['abs_error_sum'])}_countTotal{int(row['count_total'])}",
+                    )
+                    os.makedirs(sub, exist_ok=False)
+
+                    with open(os.path.join(sub, "params_used.txt"), "w", encoding="utf-8") as f:
+                        for k in names:
+                            f.write(f"{k}={params[k]}\n")
+                        f.write(f"abs_error_sum={row['abs_error_sum']}\n")
+                        f.write(f"count_total={row['count_total']}\n")
+                        f.write(f"n_images={row['n_images']}\n")
+                        f.write(f"candidate_id={row['candidate_id']}\n")
+
+                    save_top_images_for_params(
+                        images=args["images"],
+                        out_dir=sub,
+                        params=params,
+                        gt_map=args["gt_map"],
+                        img01_cache=img01_cache,
+                        dapi_cache=dapi_cache,
+                        png_compression=int(args["png_comp"]),
+                        viz_downsample_factor=int(args["downsample"]),
+                    )
+
+                self.msg_q.put(("done", out_root))
+                return
+
+            # -------------------- Mode B: Brute force (full grid) --------------------
+            live_wide_path = os.path.join(out_root, "live_results_wide.csv")
+
+            wide_fieldnames = ["combo_index"] + names + ["abs_error_sum", "count_total", "n_images"]
+            for bn in basenames:
+                tok = token_map[bn]
+                wide_fieldnames += [f"count__{tok}", f"gt__{tok}", f"abs_error__{tok}"]
+
+            rows_written = 0
+            pb_value = 0
+            combo_index = 0
+
+            # Keep topN while streaming
+            top_heap: list[tuple[int, int, int, dict]] = []  # (-err, -count, combo_index, rec)
+
+            all_rows: list[dict] = []
+            keep_all = combos_total <= WRITE_ALL_RESULTS_UP_TO
+
+            with open(live_wide_path, "w", newline="", encoding="utf-8") as wide_f:
+                wide_writer = csv.DictWriter(wide_f, fieldnames=wide_fieldnames)
+                wide_writer.writeheader()
+                wide_f.flush()
+
+                for combo in product(*all_values):
+                    if self.stop_event.is_set():
+                        self.msg_q.put(("aborted", out_root))
+                        return
+
+                    params = params_from_combo(names, combo)
+                    if not params:
+                        continue
+
+                    combo_index += 1
+
+                    abs_err_sum = 0
+                    count_total = 0
+                    per_image_count: dict[str, int] = {}
+                    per_image_err: dict[str, int] = {}
+
+                    for img_path in args["images"]:
+                        bn = os.path.basename(img_path)
+                        img01 = img01_cache[bn]
+                        gt = int(args["gt_map"][bn])
+
+                        labels, _ = make_nuclei_labels_from_img01(
+                            img01=img01,
+                            gaussian_sigma=float(params["gaussian_sigma"]),
+                            local_radius_px=int(params["local_radius_px"]),
+                            min_size_px2=int(params["min_size_px2"]),
+                            max_size_px2=int(params["max_size_px2"]),
+                            do_watershed=bool(params["do_watershed"]),
+                            watershed_h_px=float(params["watershed_h_px"]),
+                            exclude_edge=bool(params["exclude_edge"]),
+                        )
+                        cnt = int(labels.max())
+                        err = int(abs(cnt - gt))
+
+                        per_image_count[bn] = cnt
+                        per_image_err[bn] = err
+                        count_total += cnt
+                        abs_err_sum += err
+
+                    rec = {
+                        **{k: params[k] for k in names},
+                        "abs_error_sum": int(abs_err_sum),
+                        "count_total": int(count_total),
+                        "n_images": int(len(args["images"])),
+                    }
+
+                    wide_row = {"combo_index": int(combo_index), **rec}
+                    for bn in basenames:
+                        tok = token_map[bn]
+                        wide_row[f"gt__{tok}"] = int(args["gt_map"][bn])
+                        wide_row[f"count__{tok}"] = int(per_image_count[bn])
+                        wide_row[f"abs_error__{tok}"] = int(per_image_err[bn])
+
+                    wide_writer.writerow(wide_row)
+                    rows_written += 1
+                    pb_value += 1
+
+                    if keep_all:
+                        all_rows.append(rec)
+
+                    # update top heap (worst on top via negative)
+                    heapq.heappush(top_heap, (-abs_err_sum, -count_total, combo_index, rec))
+                    if len(top_heap) > TOP_N:
+                        heapq.heappop(top_heap)
+
+                    if combo_index % LOG_EVERY_PARAMS == 0 or combo_index == combos_total:
+                        # best current
+                        best_now = None
+                        if top_heap:
+                            best_now = min((-t[0]) for t in top_heap)
+                        self.msg_q.put(
+                            ("log", f"Brute force: {combo_index}/{combos_total} combos | current best abs_error_sum={best_now}")
+                        )
+                        self.msg_q.put(("progress", pb_value))
+
+                    if should_flush(rows_written):
+                        wide_f.flush()
+
+            # Save results
+            top_recs = [t[3] for t in top_heap]
+            top_df = pd.DataFrame(top_recs).sort_values(["abs_error_sum", "count_total"], ascending=[True, True])
+            top_df.to_csv(os.path.join(out_root, f"top{TOP_N}_results.csv"), index=False)
+
+            if keep_all and len(all_rows) > 0:
+                all_df = pd.DataFrame(all_rows).sort_values(["abs_error_sum", "count_total"], ascending=[True, True])
+                all_df.to_csv(os.path.join(out_root, "all_results.csv"), index=False)
+
+            # Visualize topN
+            for rank, row in enumerate(top_df.head(TOP_N).to_dict(orient="records"), start=1):
+                if self.stop_event.is_set():
+                    self.msg_q.put(("aborted", out_root))
+                    return
+
+                params = {k: row[k] for k in names}
+                params["gaussian_sigma"] = float(params["gaussian_sigma"])
+                params["watershed_h_px"] = float(params["watershed_h_px"])
+                params["local_radius_px"] = int(params["local_radius_px"])
+                params["min_size_px2"] = int(params["min_size_px2"])
+                params["max_size_px2"] = int(params["max_size_px2"])
+                params["do_watershed"] = bool(params["do_watershed"])
+                params["exclude_edge"] = bool(params["exclude_edge"])
+
+                sub = os.path.join(
+                    out_root,
+                    f"top{rank:02d}_absErrSum{int(row['abs_error_sum'])}_countTotal{int(row['count_total'])}",
+                )
+                os.makedirs(sub, exist_ok=False)
+
+                with open(os.path.join(sub, "params_used.txt"), "w", encoding="utf-8") as f:
+                    for k in names:
+                        f.write(f"{k}={params[k]}\n")
+                    f.write(f"abs_error_sum={row['abs_error_sum']}\n")
+                    f.write(f"count_total={row['count_total']}\n")
+                    f.write(f"n_images={row['n_images']}\n")
+
+                save_top_images_for_params(
+                    images=args["images"],
+                    out_dir=sub,
+                    params=params,
+                    gt_map=args["gt_map"],
+                    img01_cache=img01_cache,
+                    dapi_cache=dapi_cache,
+                    png_compression=int(args["png_comp"]),
+                    viz_downsample_factor=int(args["downsample"]),
+                )
+
+            self.msg_q.put(("done", out_root))
+
+        except Exception:
+            self.msg_q.put(("error", traceback.format_exc()))
+
+    def _poll_queue(self) -> None:
+        try:
+            while True:
+                kind, payload = self.msg_q.get_nowait()
+                if kind == "log":
+                    self.log(str(payload))
+                elif kind == "progress":
+                    self.pb["value"] = int(payload)
+                elif kind == "done":
+                    self.start_btn.config(state="normal")
+                    self.cancel_btn.config(state="disabled")
+                    out_root = str(payload)
+                    self.log(f"Done. Output: {out_root}")
+                    messagebox.showinfo("Done", f"Calibration finished.\nOutput:\n{out_root}", parent=self.root)
+                elif kind == "aborted":
+                    self.start_btn.config(state="normal")
+                    self.cancel_btn.config(state="disabled")
+                    out_root = payload
+                    if out_root:
+                        self.log(f"Aborted. Partial output may exist: {out_root}")
+                    else:
+                        self.log("Aborted.")
+                    messagebox.showinfo("Aborted", "Calibration aborted.", parent=self.root)
+                elif kind == "error":
+                    self.start_btn.config(state="normal")
+                    self.cancel_btn.config(state="disabled")
+                    self.log("ERROR:\n" + str(payload))
+                    messagebox.showerror("Error", str(payload), parent=self.root)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_queue)
+
+
+def main() -> None:
+    root = tk.Tk()
+    _ = CalibratorApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
