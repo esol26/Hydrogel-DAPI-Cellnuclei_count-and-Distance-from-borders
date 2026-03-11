@@ -1,0 +1,2 @@
+# Hydrogel-DAPI-Cellnuclei_count-and-Distance-from-borders
+Two Python GUI tools for automated DAPI fluorescence microscopy analysis: (1) Nuclei segmentation, counting, distance-based classification, zone mapping &amp; heatmap generation with batch support. (2) Parameter calibrator with staged pruning or brute-force grid search against ground-truth counts. Developed with the assistance of ChatGPT 5.2.
