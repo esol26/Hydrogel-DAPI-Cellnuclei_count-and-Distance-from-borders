@@ -1,0 +1,2183 @@
+import os
+import re
+import shutil
+import traceback
+import threading
+import queue
+import time
+import gc
+from datetime import datetime
+from typing import Optional, Tuple, List, Dict, Any
+
+import numpy as np
+import pandas as pd
+import tifffile as tiff
+import cv2
+
+from scipy import ndimage as ndi
+from scipy.spatial import cKDTree
+
+from skimage import filters, morphology, measure, segmentation
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+
+DAPI_ANALYZE_GUI_VERSION = "2026-02-20_ManualBatchQueue_pxPerUmPerImage_NoAutoDisableWS_ImagesOnly_ClassesZonesHeatmap"
+EXCLUDED_GRAY = 160
+
+
+# ======================================================================================
+# Exceptions / abort
+# ======================================================================================
+class AbortRequested(RuntimeError):
+    pass
+
+
+def abort_check(abort_event: Optional[threading.Event]):
+    if abort_event is not None and abort_event.is_set():
+        raise AbortRequested("Abort requested by user.")
+
+
+# ======================================================================================
+# Defaults (kept explicit; NO auto-disable-watershed feature)
+# ======================================================================================
+DEFAULTS: Dict[str, Any] = {
+    # Scale / distance classes
+    "px_per_um": 0.0,
+    "distance_thresholds_um": "200,500",
+
+    # Segmentation
+    "gaussian_sigma": 0.57,
+    "local_radius_px": 5,
+    "min_size_px2": 40,
+    "max_size_px2": 500,
+
+    # Watershed
+    "do_watershed": True,
+    "watershed_h_px": 2.2,
+
+    "exclude_edge": True,
+
+    # Boundaries
+    "skeletonize_boundary": True,
+
+    # Output images (ONLY these image outputs exist in this version)
+    "save_classes_filled": True,         # distance mode only
+    "save_distance_zones_image": True,   # distance mode only
+
+    # Heatmap (grid-based) - uses COUNT per tile, fixed scale
+    "save_local_density_map": True,
+    "density_cell_um": 100.0,
+    "density_colormap": "turbo",         # turbo|jet
+
+    "density_show_colorbar": True,
+    "density_embed_colorbar": True,
+    "density_colorbar_side": "right",
+    "density_colorbar_width": 120,
+    "density_colorbar_padding": 10,
+    "density_excluded_gray": 0,
+
+    # Heatmap area mask mode
+    "density_use_ring_if_available": True,
+    "density_use_included_only": True,
+    "density_tissue_mask_from_nuclei": True,
+    "density_tissue_mask_ds": 8,
+    "density_tissue_dilate_um": 60.0,
+    "density_tissue_close_um": 40.0,
+    "save_density_mask_debug": False,
+
+    # Zone-area per class/subzone for summary density
+    "compute_zone_area_for_density": True,
+    "density_area_downsample_factor": 8,
+
+    # Distance subzones + overlap shading
+    "compute_distance_subzones": True,
+    "zones_overlap_darken_factor": 0.65,
+    "zones_downsample_factor": 8,
+    "zones_overlay_boundaries_blue": True,
+
+    # Debug
+    "save_debug_boundary_masks": True,
+    "save_debug_nuclei_mask": False,
+
+    # PNG compression
+    "png_compression": 1,
+
+    # Path safety
+    "max_basename_len": 60,
+
+    # CSV (Excel DE)
+    "csv_sep": ";",
+    "csv_decimal": ",",
+
+    # Summary rounding
+    "summary_round_decimals": 4,
+
+    # Advanced
+    "abort_check_every_n_objects": 256,
+    "remove_line_artifacts": True,
+    "line_artifact_max_h_px": 2,
+    "line_artifact_min_w_px": 80,
+    "line_artifact_min_aspect": 15.0,
+
+    # Heatmap tiles CSV
+    "save_local_density_tiles_csv": True,
+
+    # Fixed COUNT heatmap scale (nuclei per tile)
+    "heatmap_fixed_count_vmin": 0.0,
+    "heatmap_fixed_count_vmax": 30.0,
+}
+
+
+EXPECTED_OBJECT_COLUMNS = [
+    "ObjectID",
+    "Included",
+    "ExcludedOutsideOuter",
+    "ExcludedInsideInner",
+    "InsideOuter",
+    "InsideInner",
+    "X_px",
+    "Y_px",
+    "X_um",
+    "Y_um",
+    "Area_px2",
+    "Area_um2",
+    "MeanIntensity",
+    "DistOuterRaw_px",
+    "DistInnerRaw_px",
+    "DistMinDirected_px",
+    "DistOuterRaw_um",
+    "DistInnerRaw_um",
+    "DistMinDirected_um",
+    "DistanceClass",
+    "DistanceClassLabel",
+    "DistanceClassOuter",
+    "DistanceClassInner",
+    "DistanceSubzone",
+]
+
+
+# ======================================================================================
+# Helpers: path / csv / image I/O
+# ======================================================================================
+def safe_stem(s: str, max_len: int = 60) -> str:
+    s = str(s).strip()
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    if len(s) > int(max_len):
+        s = s[: int(max_len)]
+    return s if s else "file"
+
+
+def make_run_output_dir(parent_dir: str, dapi_path: str, max_basename_len: int = 60) -> Tuple[str, str, str]:
+    base_original = os.path.splitext(os.path.basename(dapi_path))[0]
+    base_safe = safe_stem(base_original, max_len=max_basename_len)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_root = os.path.join(parent_dir, "dapi_results")
+    out_dir = os.path.join(results_root, f"{base_safe}_{ts}")
+    os.makedirs(out_dir, exist_ok=False)
+    return out_dir, base_safe, base_original
+
+
+def save_run_artifacts(out_dir: str):
+    try:
+        this_file = os.path.abspath(__file__)
+        shutil.copyfile(this_file, os.path.join(out_dir, "used_code.txt"))
+    except Exception as e:
+        with open(os.path.join(out_dir, "used_code_error.txt"), "w", encoding="utf-8") as f:
+            f.write(str(e) + "\n")
+
+
+def write_csv(df: pd.DataFrame, path: str, sep: str, decimal: str, round_decimals: Optional[int] = None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    out = df.copy()
+    if round_decimals is not None:
+        num_cols = out.select_dtypes(include=[np.number]).columns
+        if len(num_cols) > 0:
+            out[num_cols] = out[num_cols].round(int(round_decimals))
+    out.to_csv(path, index=False, sep=str(sep), decimal=str(decimal))
+
+
+def read_image_any(path: str) -> np.ndarray:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in [".tif", ".tiff"]:
+        return tiff.imread(path)
+
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError(f"Could not read image: {path}")
+
+    if img.ndim == 3 and img.shape[2] == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    elif img.ndim == 3 and img.shape[2] == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+    return img
+
+
+def to_float01(img: np.ndarray) -> np.ndarray:
+    img = img.astype(np.float32, copy=False)
+    mn = float(np.nanmin(img))
+    mx = float(np.nanmax(img))
+    if mx <= mn:
+        return np.zeros_like(img, dtype=np.float32)
+    return (img - mn) / (mx - mn)
+
+
+def as_gray(img: np.ndarray) -> np.ndarray:
+    if img.ndim == 2:
+        return img
+    if img.ndim == 3:
+        if img.shape[-1] in (3, 4):
+            return np.max(img[..., :3], axis=-1)
+        if img.shape[0] in (3, 4):
+            return np.max(img[:3, ...], axis=0)
+        return np.max(img, axis=0)
+    raise ValueError(f"Unsupported image shape: {img.shape}")
+
+
+def extract_blue_channel(dapi: np.ndarray) -> np.ndarray:
+    if dapi.ndim == 2:
+        return dapi
+    if dapi.ndim == 3 and dapi.shape[-1] >= 3:
+        return dapi[..., 2]
+    if dapi.ndim == 3 and dapi.shape[0] >= 3:
+        return dapi[2, ...]
+    return as_gray(dapi)
+
+
+# ======================================================================================
+# PNG writing (unicode-safe)
+# ======================================================================================
+def write_png_unicode_safe(path: str, img: np.ndarray, png_compression: int = 1):
+    png_compression = int(max(0, min(9, int(png_compression))))
+    if os.path.splitext(path)[1].lower() != ".png":
+        raise ValueError(f"Expected .png output path, got: {path}")
+
+    ok, buf = cv2.imencode(".png", img, [cv2.IMWRITE_PNG_COMPRESSION, png_compression])
+    if not ok:
+        raise IOError(f"cv2.imencode failed for PNG: {path}")
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(buf.tobytes())
+
+
+def save_bool_png(path: str, mask: np.ndarray, png_compression: int = 1):
+    img8 = (mask.astype(np.uint8) * 255)
+    write_png_unicode_safe(path, img8, png_compression)
+
+
+# ======================================================================================
+# Distance thresholds / classes
+# ======================================================================================
+def parse_thresholds_list(s: str) -> List[float]:
+    if s is None:
+        return []
+    parts = re.split(r"[,\s;]+", str(s).strip())
+    parts = [p for p in parts if p]
+    vals = [float(p) for p in parts]
+    if any(v < 0 for v in vals):
+        raise ValueError("Distance thresholds must be >= 0")
+    vals_sorted = sorted(vals)
+    for i in range(1, len(vals_sorted)):
+        if vals_sorted[i] <= vals_sorted[i - 1]:
+            raise ValueError("Distance thresholds must be strictly increasing (e.g. 200,500)")
+    return vals_sorted
+
+
+def classify_by_thresholds(dist_um: float, thresholds_um: List[float]) -> int:
+    if dist_um < 0:
+        return 0
+    if len(thresholds_um) == 0:
+        return 1
+    if dist_um < thresholds_um[0]:
+        return 1
+    for i in range(1, len(thresholds_um)):
+        lo = thresholds_um[i - 1]
+        hi = thresholds_um[i]
+        if lo <= dist_um <= hi:
+            return i + 1
+    if dist_um > thresholds_um[-1]:
+        return len(thresholds_um) + 1
+    return len(thresholds_um)
+
+
+def class_label(class_code: int, thresholds_um: List[float]) -> str:
+    if class_code <= 0:
+        return "NA"
+    if len(thresholds_um) == 0:
+        return "all"
+    n = len(thresholds_um)
+    if class_code == 1:
+        return f"<{thresholds_um[0]}"
+    if 2 <= class_code <= n:
+        lo = thresholds_um[class_code - 2]
+        hi = thresholds_um[class_code - 1]
+        return f"{lo}-{hi}"
+    if class_code == n + 1:
+        return f">{thresholds_um[-1]}"
+    return "NA"
+
+
+def class_to_color_rgb(class_code: int, included: bool, thresholds_um: List[float]) -> Tuple[int, int, int]:
+    if not included:
+        return (EXCLUDED_GRAY, EXCLUDED_GRAY, EXCLUDED_GRAY)
+
+    # fixed mapping for 2 thresholds -> 3 classes
+    if len(thresholds_um) == 2:
+        if class_code == 1:
+            return (0, 255, 0)      # green
+        if class_code == 2:
+            return (255, 255, 0)    # yellow
+        if class_code == 3:
+            return (255, 0, 0)      # red
+        return (EXCLUDED_GRAY, EXCLUDED_GRAY, EXCLUDED_GRAY)
+
+    palette_rgb = [
+        (0, 255, 0), (255, 255, 0), (255, 0, 0),
+        (0, 255, 255), (255, 0, 255), (0, 128, 255),
+        (255, 128, 0),
+    ]
+    idx = max(1, class_code) - 1
+    return palette_rgb[idx % len(palette_rgb)]
+
+
+def darken_rgb_u8(rgb: np.ndarray, factor: float) -> np.ndarray:
+    f = float(max(0.0, min(1.0, factor)))
+    return np.clip((rgb.astype(np.float32) * f), 0, 255).astype(np.uint8)
+
+
+def distance_subzone_from_classes(c_min: int, c_outer: int, c_inner: int) -> str:
+    if c_min <= 0 or c_outer <= 0 or c_inner <= 0:
+        return "none"
+    if c_outer == c_inner == c_min:
+        return "overlap"
+    if c_min == c_outer:
+        return "outer_only"
+    if c_min == c_inner:
+        return "inner_only"
+    return "none"
+
+
+# ======================================================================================
+# Segmentation (Phansalkar + global floor + line-artifact removal)
+# ======================================================================================
+def phansalkar_threshold(img01: np.ndarray, radius: int, k: float = 0.25, r: float = 0.5) -> np.ndarray:
+    if radius < 1:
+        raise ValueError("local_radius_px must be >= 1")
+
+    p = 2.0
+    q = 10.0
+    R = float(r)
+
+    size = 2 * radius + 1
+    m = ndi.uniform_filter(img01, size=size, mode="reflect")
+    m2 = ndi.uniform_filter(img01 * img01, size=size, mode="reflect")
+    s = np.sqrt(np.maximum(m2 - m * m, 0.0))
+
+    T = m * (1.0 + p * np.exp(-q * m) + float(k) * ((s / (R + 1e-12)) - 1.0))
+    return T
+
+
+def remove_line_like_components(mask: np.ndarray, max_h: int, min_w: int, min_aspect: float) -> np.ndarray:
+    lab = measure.label(mask.astype(bool))
+    if lab.max() == 0:
+        return mask.astype(bool)
+
+    keep = np.zeros_like(mask, dtype=bool)
+    for r in measure.regionprops(lab):
+        minr, minc, maxr, maxc = r.bbox
+        h = maxr - minr
+        w = maxc - minc
+        aspect = w / float(h + 1e-6)
+
+        is_line = (h <= int(max_h)) and (w >= int(min_w)) and (aspect >= float(min_aspect))
+        if not is_line:
+            keep[lab == r.label] = True
+
+    return keep
+
+
+def make_nuclei_labels(
+    dapi_blue: np.ndarray,
+    gaussian_sigma: float,
+    local_radius_px: int,
+    do_watershed: bool,
+    watershed_h_px: float,
+    exclude_edge: bool,
+    min_size_px2: int,
+    max_size_px2: int,
+    remove_line_artifacts_flag: bool,
+    line_max_h: int,
+    line_min_w: int,
+    line_min_aspect: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    img01 = to_float01(dapi_blue)
+
+    if gaussian_sigma and gaussian_sigma > 0:
+        img01 = filters.gaussian(img01, sigma=float(gaussian_sigma), preserve_range=True).astype(np.float32)
+
+    # Local threshold
+    T_local = phansalkar_threshold(img01, radius=int(local_radius_px))
+
+    # Global floor (Otsu)
+    try:
+        T_global = float(filters.threshold_otsu(img01))
+    except Exception:
+        T_global = 0.02
+    noise_floor = T_global * 0.3
+
+    mask = (img01 > T_local) & (img01 > noise_floor)
+
+    if int(min_size_px2) > 0:
+        mask = morphology.remove_small_objects(mask.astype(bool), min_size=int(min_size_px2))
+    else:
+        mask = mask.astype(bool)
+
+    mask = ndi.binary_fill_holes(mask)
+
+    if remove_line_artifacts_flag:
+        mask = remove_line_like_components(mask, max_h=line_max_h, min_w=line_min_w, min_aspect=line_min_aspect)
+
+    if do_watershed:
+        dist = ndi.distance_transform_edt(mask)
+        h = float(watershed_h_px)
+        if h <= 0:
+            labels = measure.label(mask)
+        else:
+            maxima = morphology.h_maxima(dist, h=h)
+            markers = measure.label(maxima)
+            if markers.max() == 0:
+                markers = measure.label(mask)
+            labels = segmentation.watershed(-dist, markers, mask=mask)
+    else:
+        labels = measure.label(mask)
+
+    if exclude_edge:
+        labels = segmentation.clear_border(labels)
+
+    # area filter + relabel
+    out = np.zeros_like(labels, dtype=np.int32)
+    new_id = 1
+    for p in measure.regionprops(labels):
+        if p.area < int(min_size_px2) or p.area > int(max_size_px2):
+            continue
+        out[labels == p.label] = new_id
+        new_id += 1
+
+    return out, mask
+
+
+# ======================================================================================
+# Boundary binarization + KDTree
+# ======================================================================================
+def _score_boundary_mask(b: np.ndarray) -> float:
+    n = int(b.sum())
+    if n <= 0:
+        return -1.0
+    frac = n / float(b.size)
+    if frac > 0.25:
+        return -1.0
+    return float(n) * (1.0 - frac)
+
+
+def binarize_boundary_line(
+    boundary_img: np.ndarray,
+    debug_dir: Optional[str] = None,
+    tag: str = "boundary",
+    png_compression: int = 1,
+) -> Tuple[np.ndarray, np.ndarray, str]:
+    if debug_dir is not None:
+        os.makedirs(debug_dir, exist_ok=True)
+
+    candidates: List[Tuple[str, np.ndarray]] = []
+    g01 = to_float01(as_gray(boundary_img))
+
+    # Otsu gray
+    try:
+        t = filters.threshold_otsu(g01)
+        b = g01 > t
+        if b.mean() > 0.5:
+            b = ~b
+        candidates.append(("otsu_gray", b))
+    except Exception:
+        pass
+
+    # Canny
+    try:
+        g8 = np.clip(g01 * 255.0, 0, 255).astype(np.uint8)
+        edges = cv2.Canny(g8, 30, 120) > 0
+        edges = morphology.dilation(edges, morphology.disk(1))
+        candidates.append(("canny_edges", edges))
+    except Exception:
+        pass
+
+    # Color heuristics
+    if boundary_img.ndim == 3 and boundary_img.shape[-1] in (3, 4):
+        rgb01 = to_float01(boundary_img[..., :3])
+        nonblack = np.max(rgb01, axis=-1) > 0.03
+        candidates.append(("nonblack_rgb", nonblack))
+
+        rgb8 = np.clip(rgb01 * 255.0, 0, 255).astype(np.uint8)
+        hsv = cv2.cvtColor(rgb8, cv2.COLOR_RGB2HSV)
+        hh = hsv[..., 0].astype(np.int16)
+        ss = hsv[..., 1].astype(np.int16)
+        vv = hsv[..., 2].astype(np.int16)
+        blue_hsv = (hh >= 90) & (hh <= 140) & (ss >= 80) & (vv >= 40)
+        candidates.append(("blue_hsv", blue_hsv))
+
+    processed: List[Tuple[str, np.ndarray, np.ndarray, float]] = []
+    for name, cand in candidates:
+        cand = cand.astype(bool)
+        cand_close = morphology.closing(cand, morphology.disk(1))
+        s1 = _score_boundary_mask(cand)
+        s2 = _score_boundary_mask(cand_close)
+        chosen, score = (cand_close, s2) if s2 > s1 else (cand, s1)
+        if score < 0:
+            continue
+        inside = ndi.binary_fill_holes(chosen)
+        processed.append((name, chosen, inside, score))
+
+    if not processed:
+        raise ValueError(f"Boundary binarization failed (tag={tag}).")
+
+    processed.sort(key=lambda x: x[3], reverse=True)
+    best_name, best_bin, best_inside, _ = processed[0]
+
+    if debug_dir is not None:
+        save_bool_png(os.path.join(debug_dir, f"{tag}_BEST_{best_name}.png"), best_bin, png_compression=png_compression)
+        save_bool_png(os.path.join(debug_dir, f"{tag}_BEST_{best_name}_inside.png"), best_inside, png_compression=png_compression)
+
+    return best_bin, best_inside, best_name
+
+
+def build_kdtree_from_boundary(boundary_bin: np.ndarray, skeletonize: bool) -> Tuple[cKDTree, int]:
+    b = morphology.skeletonize(boundary_bin) if skeletonize else boundary_bin
+    if int(b.sum()) == 0:
+        b = boundary_bin
+    pts = np.column_stack(np.nonzero(b))
+    if pts.shape[0] == 0:
+        raise ValueError("Boundary mask has 0 pixels after binarization/skeletonize.")
+    tree = cKDTree(pts.astype(np.float32))
+    return tree, int(pts.shape[0])
+
+
+# ======================================================================================
+# Areas
+# ======================================================================================
+def px_area_to_mm2(area_px: int, px_per_um: float) -> float:
+    area_um2 = float(area_px) / float(px_per_um * px_per_um)
+    return area_um2 / 1e6
+
+
+def ring_area_mm2(outer_inside: np.ndarray, inner_inside: np.ndarray, px_per_um: float) -> float:
+    ring = outer_inside & (~inner_inside)
+    return px_area_to_mm2(int(ring.sum()), px_per_um)
+
+
+# ======================================================================================
+# Heatmap (fixed COUNT scale 0..25, turbo/jet)
+# ======================================================================================
+def _colormap_id(colormap: str) -> int:
+    cm = str(colormap).strip().lower()
+    if cm == "turbo" and hasattr(cv2, "COLORMAP_TURBO"):
+        return cv2.COLORMAP_TURBO
+    return cv2.COLORMAP_JET
+
+
+def counts_to_colormap_bgr_fixed(
+    counts: np.ndarray,
+    vmin: float,
+    vmax: float,
+    colormap: str,
+    excluded_gray: int,
+    valid_mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    c = counts.astype(np.float32, copy=False)
+    valid = np.isfinite(c) if valid_mask is None else (valid_mask.astype(bool) & np.isfinite(c))
+
+    eg = int(max(0, min(255, int(excluded_gray))))
+    out = np.zeros((c.shape[0], c.shape[1], 3), dtype=np.uint8)
+    out[:] = (eg, eg, eg)
+
+    if not np.any(valid):
+        return out
+
+    lo = float(vmin)
+    hi = float(vmax)
+    if hi <= lo:
+        hi = lo + 1.0
+
+    x = np.clip((c - lo) / (hi - lo), 0.0, 1.0)
+    u8 = (x * 255.0).astype(np.uint8)
+
+    colored = cv2.applyColorMap(u8, _colormap_id(colormap))
+    out[valid] = colored[valid]
+    return out
+
+
+def make_colormap_colorbar_bgr(
+    vmin: float,
+    vmax: float,
+    colormap: str,
+    width: int,
+    height: int,
+    title: str = "nuclei/tile",
+) -> np.ndarray:
+    width = max(70, int(width))
+    height = max(160, int(height))
+
+    grad = np.linspace(1.0, 0.0, height, dtype=np.float32)[:, None]
+    u8 = (grad * 255.0).astype(np.uint8)
+    u8 = np.repeat(u8, width, axis=1)
+
+    bar = cv2.applyColorMap(u8, _colormap_id(colormap))
+    canvas = bar.copy()
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(canvas, title, (5, 18), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(canvas, f"{vmax:.0f}", (5, 44), font, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(canvas, f"{vmin:.0f}", (5, height - 10), font, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
+    return canvas
+
+
+def embed_colorbar_into_heatmap(heat_bgr: np.ndarray, colorbar_bgr: np.ndarray, side: str, pad: int) -> np.ndarray:
+    side = str(side).strip().lower()
+    pad = max(0, int(pad))
+
+    if side == "bottom":
+        spacer = np.zeros((pad, heat_bgr.shape[1], 3), dtype=np.uint8)
+        cb = cv2.resize(colorbar_bgr, (heat_bgr.shape[1], colorbar_bgr.shape[0]), interpolation=cv2.INTER_NEAREST)
+        return np.vstack([heat_bgr, spacer, cb])
+
+    spacer = np.zeros((heat_bgr.shape[0], pad, 3), dtype=np.uint8)
+    cb = cv2.resize(colorbar_bgr, (colorbar_bgr.shape[1], heat_bgr.shape[0]), interpolation=cv2.INTER_NEAREST)
+    return np.hstack([heat_bgr, spacer, cb])
+
+
+# ======================================================================================
+# Density grid + tiles
+# ======================================================================================
+def _get_bin_edges(n: int, step: int) -> np.ndarray:
+    step = max(1, int(step))
+    edges = np.arange(0, n + 1, step, dtype=np.int32)
+    if edges[-1] != n:
+        edges = np.append(edges, n).astype(np.int32)
+    return edges
+
+
+def build_tissue_mask_from_nuclei_mask_downsampled(
+    nuclei_mask: np.ndarray,
+    px_per_um: float,
+    ds: int,
+    dilate_um: float,
+    close_um: float,
+) -> np.ndarray:
+    ds = max(1, int(ds))
+    m = nuclei_mask[::ds, ::ds].astype(bool)
+
+    r_d = int(max(1, round(float(dilate_um) * float(px_per_um) / float(ds))))
+    r_c = int(max(0, round(float(close_um) * float(px_per_um) / float(ds))))
+
+    m = morphology.dilation(m, morphology.disk(r_d))
+    if r_c > 0:
+        m = morphology.closing(m, morphology.disk(r_c))
+    m = ndi.binary_fill_holes(m)
+    return m.astype(bool)
+
+
+def compute_local_density_grid_and_tiles(
+    xs_px: np.ndarray,
+    ys_px: np.ndarray,
+    h: int,
+    w: int,
+    px_per_um: float,
+    cell_um: float,
+    area_mask_anyshape: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, int, pd.DataFrame]:
+    """
+    Returns:
+      density_grid (nuclei/mm^2) with NaN outside mask,
+      counts_grid (nuclei/tile),
+      cell_px,
+      tiles_df
+    """
+    cell_px = int(max(1, round(float(cell_um) * float(px_per_um))))
+
+    y_edges = _get_bin_edges(int(h), cell_px)
+    x_edges = _get_bin_edges(int(w), cell_px)
+
+    counts, _, _ = np.histogram2d(
+        ys_px.astype(np.float32),
+        xs_px.astype(np.float32),
+        bins=[y_edges.astype(np.float32), x_edges.astype(np.float32)],
+    )
+    counts = counts.astype(np.float32)
+
+    heights = np.diff(y_edges).astype(np.int32)[:, None]
+    widths = np.diff(x_edges).astype(np.int32)[None, :]
+    area_px = (heights * widths).astype(np.float32)
+
+    mask_frac = None
+    if area_mask_anyshape is not None:
+        grid_h, grid_w = area_px.shape
+        frac = cv2.resize(area_mask_anyshape.astype(np.float32), (grid_w, grid_h), interpolation=cv2.INTER_AREA)
+        frac = np.clip(frac, 0.0, 1.0)
+        mask_frac = frac
+        area_px = area_px * frac
+
+    area_mm2 = (area_px / float(px_per_um * px_per_um)) / 1e6
+
+    density = np.full_like(area_mm2, np.nan, dtype=np.float32)
+    good = area_mm2 > 0
+    density[good] = counts[good] / area_mm2[good]
+
+    rows = []
+    for i in range(density.shape[0]):
+        y0 = int(y_edges[i])
+        y1 = int(y_edges[i + 1])
+        for j in range(density.shape[1]):
+            x0 = int(x_edges[j])
+            x1 = int(x_edges[j + 1])
+            rows.append({
+                "tile_i": int(i),
+                "tile_j": int(j),
+                "x0_px": x0,
+                "x1_px": x1,
+                "y0_px": y0,
+                "y1_px": y1,
+                "x0_um": float(x0 / px_per_um),
+                "x1_um": float(x1 / px_per_um),
+                "y0_um": float(y0 / px_per_um),
+                "y1_um": float(y1 / px_per_um),
+                "mask_fraction_est": float(mask_frac[i, j]) if mask_frac is not None else np.nan,
+                "area_mm2_est": float(area_mm2[i, j]),
+                "count_nuclei": float(counts[i, j]),
+                "density_nuclei_per_mm2_est": float(density[i, j]) if np.isfinite(density[i, j]) else np.nan,
+            })
+
+    tiles_df = pd.DataFrame(rows)
+    return density, counts, cell_px, tiles_df
+
+
+# ======================================================================================
+# Zones image + area by class/subzone
+# ======================================================================================
+def build_distance_zones_image_downsampled_rgb_with_overlap(
+    outer_inside: np.ndarray,
+    inner_inside: np.ndarray,
+    outer_bin: np.ndarray,
+    inner_bin: np.ndarray,
+    outer_tree: cKDTree,
+    inner_tree: cKDTree,
+    px_per_um: float,
+    thresholds_um: List[float],
+    ds: int,
+    overlay_boundaries_blue: bool,
+    overlap_darken_factor: float,
+    abort_event: Optional[threading.Event],
+) -> np.ndarray:
+    ds = max(1, int(ds))
+    ring = outer_inside & (~inner_inside)
+    ring_ds = ring[::ds, ::ds]
+
+    outer_bin_ds = outer_bin[::ds, ::ds]
+    inner_bin_ds = inner_bin[::ds, ::ds]
+
+    h_ds, w_ds = ring_ds.shape
+    rgb = np.zeros((h_ds, w_ds, 3), dtype=np.uint8)
+
+    ys, xs = np.nonzero(ring_ds)
+    if ys.size == 0:
+        if overlay_boundaries_blue:
+            rgb[(outer_bin_ds | inner_bin_ds)] = (0, 0, 255)
+        return rgb
+
+    abort_check(abort_event)
+
+    pts = np.stack([ys.astype(np.float32) * ds, xs.astype(np.float32) * ds], axis=1)
+    d_outer_px, _ = outer_tree.query(pts, k=1)
+    abort_check(abort_event)
+    d_inner_px, _ = inner_tree.query(pts, k=1)
+
+    d_outer_um = d_outer_px / float(px_per_um)
+    d_inner_um = d_inner_px / float(px_per_um)
+    d_min_um = np.minimum(d_outer_um, d_inner_um)
+
+    if len(thresholds_um) == 0:
+        c_outer = np.ones_like(d_outer_um, dtype=np.int32)
+        c_inner = np.ones_like(d_inner_um, dtype=np.int32)
+        c_min = np.ones_like(d_min_um, dtype=np.int32)
+    else:
+        th = np.array(thresholds_um, dtype=np.float32)
+        c_outer = np.digitize(d_outer_um, th, right=False).astype(np.int32) + 1
+        c_inner = np.digitize(d_inner_um, th, right=False).astype(np.int32) + 1
+        c_min = np.digitize(d_min_um, th, right=False).astype(np.int32) + 1
+
+    # LUT colors for classes
+    max_cls = int(np.max(c_min)) if c_min.size else 1
+    lut = np.zeros((max_cls + 1, 3), dtype=np.uint8)
+    for cls in range(1, max_cls + 1):
+        lut[cls] = np.array(class_to_color_rgb(cls, True, thresholds_um), dtype=np.uint8)
+
+    base_colors = lut[c_min]  # (N,3)
+
+    overlap = (c_outer == c_inner) & (c_outer == c_min)
+    if np.any(overlap):
+        base_colors[overlap] = darken_rgb_u8(base_colors[overlap], overlap_darken_factor)
+
+    rgb[ys, xs] = base_colors
+
+    if overlay_boundaries_blue:
+        rgb[(outer_bin_ds | inner_bin_ds)] = (0, 0, 255)
+
+    return rgb
+
+
+def estimate_area_by_class_and_subzone_mm2(
+    outer_inside: np.ndarray,
+    inner_inside: np.ndarray,
+    outer_tree: cKDTree,
+    inner_tree: cKDTree,
+    px_per_um: float,
+    thresholds_um: List[float],
+    ds: int,
+    abort_event: Optional[threading.Event],
+) -> pd.DataFrame:
+    ds = max(1, int(ds))
+    ring = outer_inside & (~inner_inside)
+    ring_ds = ring[::ds, ::ds]
+    ys, xs = np.nonzero(ring_ds)
+    if ys.size == 0:
+        return pd.DataFrame(columns=["DistanceClass", "DistanceSubzone", "Area_mm2_est"])
+
+    abort_check(abort_event)
+
+    pts = np.stack([ys.astype(np.float32) * ds, xs.astype(np.float32) * ds], axis=1)
+    d_outer_px, _ = outer_tree.query(pts, k=1)
+    abort_check(abort_event)
+    d_inner_px, _ = inner_tree.query(pts, k=1)
+
+    d_outer_um = d_outer_px / float(px_per_um)
+    d_inner_um = d_inner_px / float(px_per_um)
+    d_min_um = np.minimum(d_outer_um, d_inner_um)
+
+    if len(thresholds_um) == 0:
+        c_outer = np.ones_like(d_outer_um, dtype=np.int32)
+        c_inner = np.ones_like(d_inner_um, dtype=np.int32)
+        c_min = np.ones_like(d_min_um, dtype=np.int32)
+    else:
+        th = np.array(thresholds_um, dtype=np.float32)
+        c_outer = np.digitize(d_outer_um, th, right=False).astype(np.int32) + 1
+        c_inner = np.digitize(d_inner_um, th, right=False).astype(np.int32) + 1
+        c_min = np.digitize(d_min_um, th, right=False).astype(np.int32) + 1
+
+    overlap = (c_outer == c_inner) & (c_outer == c_min)
+    outer_only = (~overlap) & (c_min == c_outer)
+    inner_only = (~overlap) & (c_min == c_inner)
+
+    pixel_area_mm2 = px_area_to_mm2(int(ds * ds), px_per_um)
+
+    rows = []
+    for cls in sorted(np.unique(c_min).tolist()):
+        for name, m in [("outer_only", outer_only), ("inner_only", inner_only), ("overlap", overlap)]:
+            n = int(np.sum((c_min == cls) & m))
+            if n > 0:
+                rows.append({
+                    "DistanceClass": int(cls),
+                    "DistanceSubzone": name,
+                    "Area_mm2_est": float(n) * float(pixel_area_mm2),
+                })
+
+    return pd.DataFrame(rows)
+
+
+# ======================================================================================
+# classes_filled image
+# ======================================================================================
+def make_classes_image_rgb_lut(labels: np.ndarray, df: pd.DataFrame, thresholds_um: List[float]) -> np.ndarray:
+    max_label = int(labels.max())
+    lut = np.zeros((max_label + 1, 3), dtype=np.uint8)
+
+    if len(df) == 0 or "ObjectID" not in df.columns:
+        return lut[labels]
+
+    for _, r in df.iterrows():
+        oid = int(r["ObjectID"])
+        included = bool(int(r.get("Included", 1)))
+        class_code = int(r.get("DistanceClass", 0))
+        if 0 <= oid <= max_label:
+            lut[oid] = np.array(class_to_color_rgb(class_code, included, thresholds_um), dtype=np.uint8)
+
+    return lut[labels]
+
+
+# ======================================================================================
+# Summary (structured)
+# ======================================================================================
+def distanzklasse_text_de(class_code: int, thresholds_um: List[float]) -> str:
+    """
+    Gewünschte Benennung in der Summary:
+      - bei genau 2 Schwellen -> 3 Klassen: nah, mittel, fern
+      - sonst generisch: Klasse 1..N
+    """
+    if class_code <= 0:
+        return "NA"
+
+    if len(thresholds_um) == 2:
+        if class_code == 1:
+            return "nah"
+        if class_code == 2:
+            return "mittel"
+        if class_code == 3:
+            return "fern"
+        return f"Klasse {class_code}"
+
+    return f"Klasse {class_code}"
+
+
+def teilzone_text_de(subzone: str) -> str:
+    s = str(subzone).strip().lower()
+    if s == "outer_only":
+        return "Aussengrenze-nah"
+    if s == "inner_only":
+        return "Innengrenze-nah"
+    if s == "overlap":
+        return "Überlappung"
+    if s == "total":
+        return "Gesamt"
+    if s in ("all", "gesamt"):
+        return "gesamt"
+    return subzone
+
+def build_summary_df(
+    image_name: str,
+    df_objects: pd.DataFrame,
+    do_distances: bool,
+    px_per_um: float,
+    outer_inside: Optional[np.ndarray],
+    inner_inside: Optional[np.ndarray],
+    area_by_class_subzone_mm2: Optional[pd.DataFrame],
+    thresholds_um: List[float],
+) -> pd.DataFrame:
+    # Ringfläche
+    ring_area = np.nan
+    if do_distances and outer_inside is not None and inner_inside is not None:
+        ring_area = ring_area_mm2(outer_inside, inner_inside, px_per_um)
+
+    # Included-Filter
+    if "Included" in df_objects.columns and len(df_objects) > 0:
+        df_inc = df_objects[df_objects["Included"] == 1].copy()
+    else:
+        df_inc = df_objects.copy()
+
+    gesamt_anzahl = int(len(df_inc))
+    gesamt_dichte = (gesamt_anzahl / ring_area) if (ring_area == ring_area and ring_area > 0) else np.nan
+
+    rows: List[Dict[str, Any]] = []
+
+    # 1) Gesamtzeile
+    rows.append({
+        "Bildname": image_name,
+        "Zeilentyp": "Gesamt",
+        "Distanzklasse_Code": np.nan,
+        "Distanzklasse": "gesamt",
+        "Teilzone": "gesamt",
+        "Zellkerne_Anzahl": gesamt_anzahl,
+        "Anteil_Zellkerne_Prozent": 100.0 if gesamt_anzahl > 0 else 0.0,
+        "Fläche_mm2_geschätzt": float(ring_area) if ring_area == ring_area else np.nan,
+        "Anteil_Fläche_Prozent": 100.0 if (ring_area == ring_area and ring_area > 0) else np.nan,
+        "Dichte_Zellkerne_pro_mm2": float(gesamt_dichte) if gesamt_dichte == gesamt_dichte else np.nan,
+    })
+
+    if do_distances:
+        # Klassenanzahl: bei Schwellenliste Länge k -> k+1 Klassen
+        n_classes = len(thresholds_um) + 1
+
+        for cls in range(1, n_classes + 1):
+            cls_txt = distanzklasse_text_de(cls, thresholds_um)
+
+            mask_cls = (df_inc["DistanceClass"] == cls) if ("DistanceClass" in df_inc.columns and len(df_inc) > 0) else np.zeros((len(df_inc),), dtype=bool)
+            count_total = int(mask_cls.sum())
+
+            # Fläche dieser Klasse = Summe der Teilzonenflächen (falls vorhanden)
+            area_total = np.nan
+            if area_by_class_subzone_mm2 is not None and len(area_by_class_subzone_mm2) > 0:
+                m = (area_by_class_subzone_mm2["DistanceClass"] == cls)
+                area_total = float(area_by_class_subzone_mm2.loc[m, "Area_mm2_est"].sum())
+                if area_total <= 0:
+                    area_total = np.nan
+
+            dens_total = (count_total / area_total) if (area_total == area_total and area_total > 0) else np.nan
+            perc_nuc_total = (count_total / gesamt_anzahl * 100.0) if gesamt_anzahl > 0 else 0.0
+            perc_area_total = (area_total / ring_area * 100.0) if (ring_area == ring_area and ring_area > 0 and pd.notna(area_total)) else np.nan
+
+            rows.append({
+                "Bildname": image_name,
+                "Zeilentyp": "Distanzklasse_Gesamt",
+                "Distanzklasse_Code": cls,
+                "Distanzklasse": cls_txt,
+                "Teilzone": teilzone_text_de("total"),
+                "Zellkerne_Anzahl": count_total,
+                "Anteil_Zellkerne_Prozent": float(perc_nuc_total),
+                "Fläche_mm2_geschätzt": float(area_total) if pd.notna(area_total) else np.nan,
+                "Anteil_Fläche_Prozent": float(perc_area_total) if pd.notna(perc_area_total) else np.nan,
+                "Dichte_Zellkerne_pro_mm2": float(dens_total) if pd.notna(dens_total) else np.nan,
+            })
+
+            # Teilzonen: HG-Rand-nah / HF-Rand-nah / Überlappung
+            for subz in ["outer_only", "inner_only", "overlap"]:
+                mask_sub = mask_cls & (df_inc["DistanceSubzone"] == subz) if ("DistanceSubzone" in df_inc.columns and len(df_inc) > 0) else np.zeros((len(df_inc),), dtype=bool)
+                count_sub = int(mask_sub.sum())
+
+                area_sub = np.nan
+                if area_by_class_subzone_mm2 is not None and len(area_by_class_subzone_mm2) > 0:
+                    m = (area_by_class_subzone_mm2["DistanceClass"] == cls) & (area_by_class_subzone_mm2["DistanceSubzone"] == subz)
+                    if int(m.sum()) > 0:
+                        area_sub = float(area_by_class_subzone_mm2.loc[m, "Area_mm2_est"].sum())
+                    if area_sub <= 0:
+                        area_sub = np.nan
+
+                dens_sub = (count_sub / area_sub) if (area_sub == area_sub and area_sub > 0) else np.nan
+                perc_nuc_sub = (count_sub / gesamt_anzahl * 100.0) if gesamt_anzahl > 0 else 0.0
+                perc_area_sub = (area_sub / ring_area * 100.0) if (ring_area == ring_area and ring_area > 0 and pd.notna(area_sub)) else np.nan
+
+                rows.append({
+                    "Bildname": image_name,
+                    "Zeilentyp": "Distanzklasse_Teilzone",
+                    "Distanzklasse_Code": cls,
+                    "Distanzklasse": cls_txt,
+                    "Teilzone": teilzone_text_de(subz),
+                    "Zellkerne_Anzahl": count_sub,
+                    "Anteil_Zellkerne_Prozent": float(perc_nuc_sub),
+                    "Fläche_mm2_geschätzt": float(area_sub) if pd.notna(area_sub) else np.nan,
+                    "Anteil_Fläche_Prozent": float(perc_area_sub) if pd.notna(perc_area_sub) else np.nan,
+                    "Dichte_Zellkerne_pro_mm2": float(dens_sub) if pd.notna(dens_sub) else np.nan,
+                })
+
+    return pd.DataFrame(rows)
+
+# ======================================================================================
+# Analysis info TXT
+# ======================================================================================
+def write_analysis_info_txt(
+    path: str,
+    dapi_path: str,
+    outer_path: Optional[str],
+    inner_path: Optional[str],
+    params: dict,
+    do_distances: bool,
+    h: int,
+    w: int,
+    px_per_um: float,
+    thresholds_um: List[float],
+    outer_mode: str,
+    inner_mode: str,
+    outer_n: int,
+    inner_n: int,
+    ring_area_mm2_val: float,
+):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    mp = (h * w) / 1e6
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"VERSION: {DAPI_ANALYZE_GUI_VERSION}\n")
+        f.write(f"Timestamp: {datetime.now().isoformat(timespec='seconds')}\n\n")
+
+        f.write("=== INPUTS ===\n")
+        f.write(f"DAPI: {dapi_path}\n")
+        f.write(f"OUTER: {outer_path}\n")
+        f.write(f"INNER: {inner_path}\n")
+        f.write(f"do_distances: {do_distances}\n\n")
+
+        f.write("=== IMAGE PARAMETERS ===\n")
+        f.write(f"Height_px: {h}\n")
+        f.write(f"Width_px: {w}\n")
+        f.write(f"Megapixels: {mp:.2f}\n")
+        f.write(f"px_per_um: {px_per_um}\n")
+        f.write(f"RingArea_mm2: {ring_area_mm2_val}\n\n")
+
+        f.write("=== DISTANCE CLASS PARAMETERS ===\n")
+        f.write(f"thresholds_um: {thresholds_um}\n\n")
+
+        f.write("=== BOUNDARY BINARIZATION ===\n")
+        f.write(f"outer_mode: {outer_mode}\n")
+        f.write(f"inner_mode: {inner_mode}\n")
+        f.write(f"outer_points: {outer_n}\n")
+        f.write(f"inner_points: {inner_n}\n\n")
+
+        f.write("=== ANALYSIS PARAMETERS (full) ===\n")
+        for k in sorted(params.keys()):
+            f.write(f"{k}: {params[k]}\n")
+
+
+# ======================================================================================
+# Core analysis
+# ======================================================================================
+def analyze_one(
+    dapi_path: str,
+    out_dir: str,
+    base_safe: str,
+    base_original: str,
+    params: dict,
+    do_distances: bool,
+    outer_path: Optional[str],
+    inner_path: Optional[str],
+    log_fn=None,
+    abort_event: Optional[threading.Event] = None,
+):
+    def log(msg: str):
+        if log_fn:
+            log_fn(msg)
+        else:
+            print(msg)
+
+    abort_check(abort_event)
+
+    thresholds_um: List[float] = params["thresholds_um"]
+    px_per_um = float(params["px_per_um"])
+    png_comp = int(params["png_compression"])
+    csv_sep = str(params["csv_sep"])
+    csv_decimal = str(params["csv_decimal"])
+    round_dec = int(params["summary_round_decimals"])
+
+    # run log
+    with open(os.path.join(out_dir, "run_log.txt"), "w", encoding="utf-8") as f:
+        f.write(f"VERSION: {DAPI_ANALYZE_GUI_VERSION}\n")
+        f.write(f"DAPI: {dapi_path}\n")
+        f.write(f"do_distances: {do_distances}\n")
+        f.write(f"OUTER: {outer_path}\n")
+        f.write(f"INNER: {inner_path}\n")
+        f.write(f"base_original: {base_original}\n")
+        f.write(f"base_safe: {base_safe}\n")
+        for k in sorted(params.keys()):
+            f.write(f"{k}: {params[k]}\n")
+
+    log("Loading DAPI...")
+    dapi = read_image_any(dapi_path)
+    dapi_blue = extract_blue_channel(dapi)
+    h, w = dapi_blue.shape[:2]
+    log(f"Image size: {h} x {w} px")
+
+    abort_check(abort_event)
+
+    # boundaries
+    outer_inside = inner_inside = None
+    outer_bin = inner_bin = None
+    outer_tree = inner_tree = None
+    outer_mode = inner_mode = "NA"
+    outer_n = inner_n = 0
+
+    if do_distances:
+        if not outer_path or not inner_path:
+            raise ValueError("Distance mode selected but OUTER/INNER not provided.")
+
+        outer_img = read_image_any(outer_path)
+        inner_img = read_image_any(inner_path)
+
+        if as_gray(outer_img).shape[:2] != (h, w) or as_gray(inner_img).shape[:2] != (h, w):
+            raise ValueError("Image sizes do not match (DAPI vs boundaries).")
+
+        debug_dir = out_dir if bool(params.get("save_debug_boundary_masks", True)) else None
+        log("Binarizing boundaries + building KDTree...")
+        outer_bin, outer_inside, outer_mode = binarize_boundary_line(
+            outer_img, debug_dir=debug_dir, tag=f"{base_safe}_outer", png_compression=png_comp
+        )
+        inner_bin, inner_inside, inner_mode = binarize_boundary_line(
+            inner_img, debug_dir=debug_dir, tag=f"{base_safe}_inner", png_compression=png_comp
+        )
+
+        outer_tree, outer_n = build_kdtree_from_boundary(outer_bin, bool(params.get("skeletonize_boundary", True)))
+        inner_tree, inner_n = build_kdtree_from_boundary(inner_bin, bool(params.get("skeletonize_boundary", True)))
+
+        log(f"Boundary modes: outer={outer_mode} (pts={outer_n}), inner={inner_mode} (pts={inner_n})")
+
+    abort_check(abort_event)
+
+    # segmentation
+    log("Segmenting nuclei...")
+    labels, nuclei_mask = make_nuclei_labels(
+        dapi_blue=dapi_blue,
+        gaussian_sigma=float(params["gaussian_sigma"]),
+        local_radius_px=int(params["local_radius_px"]),
+        do_watershed=bool(params["do_watershed"]),
+        watershed_h_px=float(params["watershed_h_px"]),
+        exclude_edge=bool(params["exclude_edge"]),
+        min_size_px2=int(params["min_size_px2"]),
+        max_size_px2=int(params["max_size_px2"]),
+        remove_line_artifacts_flag=bool(params.get("remove_line_artifacts", True)),
+        line_max_h=int(params.get("line_artifact_max_h_px", 2)),
+        line_min_w=int(params.get("line_artifact_min_w_px", 80)),
+        line_min_aspect=float(params.get("line_artifact_min_aspect", 15.0)),
+    )
+
+    if bool(params.get("save_debug_nuclei_mask", False)):
+        save_bool_png(os.path.join(out_dir, f"{base_safe}_DEBUG_nuclei_mask.png"), nuclei_mask, png_compression=png_comp)
+
+    abort_check(abort_event)
+
+    # regionprops -> object table
+    img01 = to_float01(dapi_blue)
+    tbl = measure.regionprops_table(
+        labels,
+        intensity_image=img01,
+        properties=("label", "area", "centroid", "mean_intensity"),
+    )
+    n_obj = len(tbl["label"])
+    log(f"Building object table for {n_obj} objects...")
+
+    rows = []
+    check_every = int(params.get("abort_check_every_n_objects", 256))
+    for i in range(n_obj):
+        if check_every > 0 and (i % check_every == 0):
+            abort_check(abort_event)
+
+        oid = int(tbl["label"][i])
+        y = int(round(float(tbl["centroid-0"][i])))
+        x = int(round(float(tbl["centroid-1"][i])))
+        x = max(0, min(w - 1, x))
+        y = max(0, min(h - 1, y))
+
+        area_px2 = float(tbl["area"][i])
+        area_um2 = float(area_px2) / float(px_per_um * px_per_um)
+        mean_int = float(tbl["mean_intensity"][i])
+
+        if do_distances:
+            inside_outer = bool(outer_inside[y, x])
+            inside_inner = bool(inner_inside[y, x])
+            excluded_outside_outer = int(not inside_outer)
+            excluded_inside_inner = int(inside_inner)
+            included = int((excluded_outside_outer == 0) and (excluded_inside_inner == 0))
+
+            d_outer_px = float(outer_tree.query([float(y), float(x)], k=1)[0])
+            d_inner_px = float(inner_tree.query([float(y), float(x)], k=1)[0])
+            d_outer_um = d_outer_px / float(px_per_um)
+            d_inner_um = d_inner_px / float(px_per_um)
+
+            if included:
+                d_min_px = float(min(d_outer_px, d_inner_px))
+                d_min_um = d_min_px / float(px_per_um)
+                c_min = classify_by_thresholds(float(d_min_um), thresholds_um)
+                c_outer = classify_by_thresholds(float(d_outer_um), thresholds_um)
+                c_inner = classify_by_thresholds(float(d_inner_um), thresholds_um)
+                sub = distance_subzone_from_classes(c_min, c_outer, c_inner)
+                c_txt = class_label(c_min, thresholds_um)
+            else:
+                d_min_px = -1.0
+                d_min_um = -1.0
+                c_min = c_outer = c_inner = 0
+                sub = "none"
+                c_txt = "EXCLUDED"
+        else:
+            inside_outer = inside_inner = False
+            excluded_outside_outer = excluded_inside_inner = 0
+            included = 1
+
+            d_outer_px = d_inner_px = d_min_px = -1.0
+            d_outer_um = d_inner_um = d_min_um = -1.0
+            c_min = c_outer = c_inner = 0
+            sub = "none"
+            c_txt = "NA"
+
+        rows.append({
+            "ObjectID": oid,
+            "Included": included,
+            "ExcludedOutsideOuter": excluded_outside_outer,
+            "ExcludedInsideInner": excluded_inside_inner,
+            "InsideOuter": int(inside_outer),
+            "InsideInner": int(inside_inner),
+            "X_px": x,
+            "Y_px": y,
+            "X_um": float(x / px_per_um),
+            "Y_um": float(y / px_per_um),
+            "Area_px2": area_px2,
+            "Area_um2": area_um2,
+            "MeanIntensity": mean_int,
+            "DistOuterRaw_px": d_outer_px,
+            "DistInnerRaw_px": d_inner_px,
+            "DistMinDirected_px": d_min_px,
+            "DistOuterRaw_um": d_outer_um,
+            "DistInnerRaw_um": d_inner_um,
+            "DistMinDirected_um": d_min_um,
+            "DistanceClass": int(c_min),
+            "DistanceClassLabel": c_txt,
+            "DistanceClassOuter": int(c_outer),
+            "DistanceClassInner": int(c_inner),
+            "DistanceSubzone": sub,
+        })
+
+    df_objects = pd.DataFrame(rows, columns=EXPECTED_OBJECT_COLUMNS)
+
+    objects_path = os.path.join(out_dir, f"{base_safe}_all_data.csv")
+    write_csv(df_objects, objects_path, sep=csv_sep, decimal=csv_decimal, round_decimals=None)
+    log(f"Wrote: {objects_path}")
+
+    abort_check(abort_event)
+
+    # Heatmap: fixed count scale 0..25
+    if bool(params.get("save_local_density_map", True)):
+        cell_um = float(params.get("density_cell_um", 100.0))
+        use_ring = bool(params.get("density_use_ring_if_available", True)) and bool(do_distances) and (outer_inside is not None) and (inner_inside is not None)
+
+        area_mask = None
+        if use_ring:
+            area_mask = (outer_inside & (~inner_inside))
+        else:
+            if bool(params.get("density_tissue_mask_from_nuclei", True)):
+                ds_m = int(params.get("density_tissue_mask_ds", 8))
+                dil_um = float(params.get("density_tissue_dilate_um", 60.0))
+                clo_um = float(params.get("density_tissue_close_um", 40.0))
+                log(f"Building tissue mask for heatmap (from nuclei_mask, ds={ds_m}, dilate={dil_um}µm, close={clo_um}µm)...")
+                area_mask = build_tissue_mask_from_nuclei_mask_downsampled(
+                    nuclei_mask=nuclei_mask,
+                    px_per_um=px_per_um,
+                    ds=ds_m,
+                    dilate_um=dil_um,
+                    close_um=clo_um,
+                )
+
+        if bool(params.get("save_density_mask_debug", False)) and area_mask is not None:
+            save_bool_png(os.path.join(out_dir, f"{base_safe}_DEBUG_heatmap_area_mask.png"), area_mask.astype(bool), png_compression=png_comp)
+
+        if len(df_objects) == 0:
+            log("No nuclei -> skipping heatmap.")
+        else:
+            xs = df_objects["X_px"].to_numpy(dtype=np.int32)
+            ys = df_objects["Y_px"].to_numpy(dtype=np.int32)
+
+            if use_ring and bool(params.get("density_use_included_only", True)):
+                m = (df_objects["Included"].to_numpy(dtype=np.int32) == 1)
+                xs = xs[m]
+                ys = ys[m]
+
+            log("Building local grid stats + tiles CSV...")
+            density_grid, counts_grid, cell_px, tiles_df = compute_local_density_grid_and_tiles(
+                xs_px=xs,
+                ys_px=ys,
+                h=h,
+                w=w,
+                px_per_um=px_per_um,
+                cell_um=cell_um,
+                area_mask_anyshape=area_mask,
+            )
+
+            if bool(params.get("save_local_density_tiles_csv", True)):
+                tiles_path = os.path.join(out_dir, f"{base_safe}_local_density_tiles_cell{cell_um:g}um.csv")
+                write_csv(tiles_df, tiles_path, sep=csv_sep, decimal=csv_decimal, round_decimals=round_dec)
+                log(f"Wrote: {tiles_path}")
+
+            vmin = float(params.get("heatmap_fixed_count_vmin", 0.0))
+            vmax = float(params.get("heatmap_fixed_count_vmax", 25.0))
+            valid_tiles = np.isfinite(density_grid)
+
+            colormap = str(params.get("density_colormap", "turbo"))
+            bgr_grid = counts_to_colormap_bgr_fixed(
+                counts=counts_grid,
+                vmin=vmin,
+                vmax=vmax,
+                colormap=colormap,
+                excluded_gray=int(params.get("density_excluded_gray", 0)),
+                valid_mask=valid_tiles,
+            )
+
+            heat_up = cv2.resize(
+                bgr_grid,
+                (bgr_grid.shape[1] * cell_px, bgr_grid.shape[0] * cell_px),
+                interpolation=cv2.INTER_NEAREST,
+            )
+
+            if bool(params.get("density_embed_colorbar", True)) and bool(params.get("density_show_colorbar", True)):
+                side = str(params.get("density_colorbar_side", "right"))
+                cb = make_colormap_colorbar_bgr(
+                    vmin=vmin,
+                    vmax=vmax,
+                    colormap=colormap,
+                    width=int(params.get("density_colorbar_width", 120)),
+                    height=heat_up.shape[0] if side.lower() == "right" else 180,
+                    title="nuclei/tile",
+                )
+                heat_up = embed_colorbar_into_heatmap(
+                    heat_bgr=heat_up,
+                    colorbar_bgr=cb,
+                    side=side,
+                    pad=int(params.get("density_colorbar_padding", 10)),
+                )
+
+            out_heat = os.path.join(out_dir, f"{base_safe}_heatmap_counts_{colormap}_cell{cell_um:g}um_vmax{vmax:g}.png")
+            write_png_unicode_safe(out_heat, heat_up, png_comp)
+            log(f"Wrote: {out_heat}")
+
+    abort_check(abort_event)
+
+    # Area by class/subzone for summary (optional but needed for Area/%/Density columns)
+    area_by_class_subzone_mm2 = None
+    if do_distances and bool(params.get("compute_zone_area_for_density", True)):
+        ds_area = int(params.get("density_area_downsample_factor", 8))
+        log(f"Estimating area by DistanceClass+Subzone (ds={ds_area})...")
+        area_by_class_subzone_mm2 = estimate_area_by_class_and_subzone_mm2(
+            outer_inside=outer_inside,
+            inner_inside=inner_inside,
+            outer_tree=outer_tree,
+            inner_tree=inner_tree,
+            px_per_um=px_per_um,
+            thresholds_um=thresholds_um,
+            ds=ds_area,
+            abort_event=abort_event,
+        )
+
+    # Summary
+    df_summary = build_summary_df(
+        image_name=base_original,
+        df_objects=df_objects,
+        do_distances=do_distances,
+        px_per_um=px_per_um,
+        outer_inside=outer_inside,
+        inner_inside=inner_inside,
+        area_by_class_subzone_mm2=area_by_class_subzone_mm2,
+        thresholds_um=thresholds_um,
+    )
+    summary_path = os.path.join(out_dir, f"{base_safe}_summary.csv")
+    write_csv(df_summary, summary_path, sep=csv_sep, decimal=csv_decimal, round_decimals=round_dec)
+    log(f"Wrote: {summary_path}")
+
+    abort_check(abort_event)
+
+    # analysis_info
+    ring_area = ring_area_mm2(outer_inside, inner_inside, px_per_um) if (do_distances and outer_inside is not None and inner_inside is not None) else float("nan")
+    write_analysis_info_txt(
+        path=os.path.join(out_dir, f"{base_safe}_analysis_info.txt"),
+        dapi_path=dapi_path,
+        outer_path=outer_path,
+        inner_path=inner_path,
+        params=params,
+        do_distances=do_distances,
+        h=h,
+        w=w,
+        px_per_um=px_per_um,
+        thresholds_um=thresholds_um,
+        outer_mode=str(outer_mode),
+        inner_mode=str(inner_mode),
+        outer_n=int(outer_n),
+        inner_n=int(inner_n),
+        ring_area_mm2_val=float(ring_area) if ring_area == ring_area else float("nan"),
+    )
+    log("Wrote: analysis_info.txt")
+
+    abort_check(abort_event)
+
+    # distance zones image
+    if do_distances and bool(params.get("save_distance_zones_image", True)):
+        ds = int(params.get("zones_downsample_factor", 8))
+        log(f"Building distance zones image (ds={ds})...")
+        zones_rgb = build_distance_zones_image_downsampled_rgb_with_overlap(
+            outer_inside=outer_inside,
+            inner_inside=inner_inside,
+            outer_bin=outer_bin,
+            inner_bin=inner_bin,
+            outer_tree=outer_tree,
+            inner_tree=inner_tree,
+            px_per_um=px_per_um,
+            thresholds_um=thresholds_um,
+            ds=ds,
+            overlay_boundaries_blue=bool(params.get("zones_overlay_boundaries_blue", True)),
+            overlap_darken_factor=float(params.get("zones_overlap_darken_factor", 0.65)),
+            abort_event=abort_event,
+        )
+        zones_bgr = cv2.cvtColor(zones_rgb, cv2.COLOR_RGB2BGR)
+        out_path = os.path.join(out_dir, f"{base_safe}_distance_zones_ds{ds}.png")
+        write_png_unicode_safe(out_path, zones_bgr, png_comp)
+        log(f"Wrote: {out_path}")
+
+    abort_check(abort_event)
+
+    # classes_filled image
+    if do_distances and bool(params.get("save_classes_filled", True)):
+        viz_ds = int(params.get("viz_downsample_factor", 1))
+        suffix = f"_ds{viz_ds}" if viz_ds != 1 else ""
+        log(f"Creating classes_filled (ds={viz_ds})...")
+        labels_v = labels if viz_ds == 1 else labels[::viz_ds, ::viz_ds]
+        classes_rgb = make_classes_image_rgb_lut(labels_v, df_objects, thresholds_um)
+        classes_bgr = cv2.cvtColor(classes_rgb, cv2.COLOR_RGB2BGR)
+        out_path = os.path.join(out_dir, f"{base_safe}_classes_filled{suffix}.png")
+        write_png_unicode_safe(out_path, classes_bgr, png_comp)
+        log(f"Wrote: {out_path}")
+
+    with open(os.path.join(out_dir, "run_info.txt"), "w", encoding="utf-8") as f:
+        f.write(f"VERSION: {DAPI_ANALYZE_GUI_VERSION}\n")
+        f.write(f"do_distances: {do_distances}\n")
+        f.write(f"Image size: {h} x {w} px\n")
+        f.write(f"outer_mode: {outer_mode}\n")
+        f.write(f"inner_mode: {inner_mode}\n")
+
+
+# ======================================================================================
+# GUI (Manual Batch Queue, px/µm per job)
+# ======================================================================================
+class DapiAnalyzeApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("DAPI Analyze - Manual Batch Queue")
+        self.geometry("1180x980")
+        self.minsize(1180, 980)
+
+        self._ui_queue: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
+        self.abort_event = threading.Event()
+
+        # Manual batch queue: list of jobs (px_per_um is job-specific)
+        self.batch_jobs: List[Dict[str, str]] = []
+
+        # timer
+        self._timer_running = False
+        self._timer_t0 = 0.0
+        self.v_elapsed = tk.StringVar(value="Dauer: 00:00:00")
+
+        self.run_mode = tk.StringVar(value="count_only")
+
+        # paths
+        self.v_dapi = tk.StringVar(value="")
+        self.v_outer = tk.StringVar(value="")
+        self.v_inner = tk.StringVar(value="")
+        self.v_parent_out = tk.StringVar(value="")
+
+        # params
+        self.v_px_per_um = tk.StringVar(value=str(DEFAULTS["px_per_um"]))
+        self.v_thresholds = tk.StringVar(value=str(DEFAULTS["distance_thresholds_um"]))
+
+        self.v_min_size = tk.StringVar(value=str(DEFAULTS["min_size_px2"]))
+        self.v_max_size = tk.StringVar(value=str(DEFAULTS["max_size_px2"]))
+        self.v_sigma = tk.StringVar(value=str(DEFAULTS["gaussian_sigma"]))
+        self.v_radius = tk.StringVar(value=str(DEFAULTS["local_radius_px"]))
+
+        self.v_watershed = tk.BooleanVar(value=bool(DEFAULTS["do_watershed"]))
+        self.v_watershed_h = tk.StringVar(value=str(DEFAULTS["watershed_h_px"]))
+        self.v_exclude_edge = tk.BooleanVar(value=bool(DEFAULTS["exclude_edge"]))
+        self.v_skeletonize = tk.BooleanVar(value=bool(DEFAULTS["skeletonize_boundary"]))
+
+        # output toggles (ONLY: classes, zones, heatmap)
+        self.v_save_classes = tk.BooleanVar(value=bool(DEFAULTS["save_classes_filled"]))
+        self.v_save_zones = tk.BooleanVar(value=bool(DEFAULTS["save_distance_zones_image"]))
+        self.v_save_local_density = tk.BooleanVar(value=bool(DEFAULTS["save_local_density_map"]))
+
+        self.v_density_cell_um = tk.StringVar(value=str(DEFAULTS["density_cell_um"]))
+        self.v_density_colormap = tk.StringVar(value=str(DEFAULTS["density_colormap"]))
+        self.v_density_embed = tk.BooleanVar(value=bool(DEFAULTS["density_embed_colorbar"]))
+
+        # debug
+        self.v_dbg_bounds = tk.BooleanVar(value=bool(DEFAULTS["save_debug_boundary_masks"]))
+        self.v_dbg_nuclei = tk.BooleanVar(value=bool(DEFAULTS["save_debug_nuclei_mask"]))
+        self.v_density_mask_debug = tk.BooleanVar(value=bool(DEFAULTS["save_density_mask_debug"]))
+
+        # misc
+        self.v_png_comp = tk.StringVar(value=str(DEFAULTS["png_compression"]))
+        self.v_max_base_len = tk.StringVar(value=str(DEFAULTS["max_basename_len"]))
+
+        self._build_ui()
+        self._apply_mode_rules()
+
+        self.run_mode.trace_add("write", lambda *_: self._apply_mode_rules())
+        self.after(100, self._poll_queue)
+
+    # ----- timer -----
+    def _timer_start(self):
+        self._timer_running = True
+        self._timer_t0 = time.perf_counter()
+        self._timer_tick()
+
+    def _timer_stop(self):
+        self._timer_running = False
+
+    def _timer_tick(self):
+        if not self._timer_running:
+            return
+        dt = max(0.0, time.perf_counter() - self._timer_t0)
+        hh = int(dt // 3600)
+        mm = int((dt % 3600) // 60)
+        ss = int(dt % 60)
+        self.v_elapsed.set(f"Dauer: {hh:02d}:{mm:02d}:{ss:02d}")
+        self.after(200, self._timer_tick)
+
+    # ----- logging + queue -----
+    def _log(self, msg: str):
+        self.txt_log.insert("end", str(msg) + "\n")
+        self.txt_log.see("end")
+        self.update_idletasks()
+
+    def _post_log(self, msg: str):
+        self._ui_queue.put(("log", msg))
+
+    def _post_done(self, out_dir: str):
+        self._ui_queue.put(("done", out_dir))
+
+    def _post_error(self, msg: str):
+        self._ui_queue.put(("error", msg))
+
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, payload = self._ui_queue.get_nowait()
+                if kind == "log":
+                    self._log(str(payload))
+                elif kind == "done":
+                    self._timer_stop()
+                    self.btn_run.configure(state="normal")
+                    self.btn_abort.configure(state="disabled")
+                    messagebox.showinfo("Fertig", f"Analyse abgeschlossen.\nOrdner:\n{payload}")
+                elif kind == "error":
+                    self._timer_stop()
+                    self.btn_run.configure(state="normal")
+                    self.btn_abort.configure(state="disabled")
+                    messagebox.showerror("Fehler", str(payload))
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
+
+    # ----- UI helpers -----
+    def _file_row(self, parent, row, label, var, cmd):
+        lbl = ttk.Label(parent, text=label, width=22)
+        lbl.grid(row=row, column=0, sticky="w", padx=6, pady=4)
+        e = ttk.Entry(parent, textvariable=var, width=92)
+        e.grid(row=row, column=1, sticky="ew", padx=6, pady=4)
+        b = ttk.Button(parent, text="Suchen...", command=cmd)
+        b.grid(row=row, column=2, sticky="w", padx=6, pady=4)
+        parent.grid_columnconfigure(1, weight=1)
+        return (lbl, e, b)
+
+    def _entry_row(self, parent, row, label, var):
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4, padx=6)
+        ttk.Entry(parent, textvariable=var, width=18).grid(row=row, column=1, sticky="w", padx=6, pady=4)
+
+    def _set_row_enabled(self, widgets, enabled: bool):
+        state = "normal" if enabled else "disabled"
+        for w in widgets:
+            try:
+                w.configure(state=state)
+            except Exception:
+                pass
+
+    # ----- batch queue helpers -----
+    def _batch_refresh_view(self):
+        for item in self.batch_tree.get_children():
+            self.batch_tree.delete(item)
+
+        for idx, job in enumerate(self.batch_jobs, start=1):
+            self.batch_tree.insert(
+                "",
+                "end",
+                iid=str(idx),
+                values=(
+                    idx,
+                    job.get("px_per_um", ""),
+                    os.path.basename(job.get("dapi", "")),
+                    os.path.basename(job.get("outer", "")),
+                    os.path.basename(job.get("inner", "")),
+                    job.get("parent_out", ""),
+                ),
+            )
+
+        self.lbl_batch_count.configure(text=f"Jobs in Queue: {len(self.batch_jobs)}")
+
+    def _batch_add_current_selection(self):
+        dapi = str(self.v_dapi.get()).strip()
+        outer = str(self.v_outer.get()).strip()
+        inner = str(self.v_inner.get()).strip()
+        parent_out = str(self.v_parent_out.get()).strip()
+
+        try:
+            px_per_um_val = float(str(self.v_px_per_um.get()).strip())
+        except Exception:
+            messagebox.showerror("Ungültig", "Pixel pro µm ist keine Zahl.")
+            return
+        if px_per_um_val <= 0:
+            messagebox.showerror("Ungültig", "Pixel pro µm muss > 0 sein.")
+            return
+
+        if not dapi:
+            messagebox.showerror("Fehlende Angabe", "Bitte wähle ein DAPI Bild aus.")
+            return
+        if not parent_out:
+            messagebox.showerror("Fehlende Angabe", "Bitte wähle einen Speicherort für die Ergebnisse.")
+            return
+
+        if (not outer) or (not inner):
+            if not messagebox.askyesno(
+                "Grenzen fehlen",
+                "Outer/Inner fehlen. Soll der Job trotzdem hinzugefügt werden (dann nur Count-only für diesen Job)?",
+            ):
+                return
+
+        self.batch_jobs.append({
+            "dapi": dapi,
+            "outer": outer,
+            "inner": inner,
+            "parent_out": parent_out,
+            "px_per_um": f"{px_per_um_val:g}",
+        })
+        self._batch_refresh_view()
+
+        # convenience: clear file fields
+        self.v_dapi.set("")
+        self.v_outer.set("")
+        self.v_inner.set("")
+
+    def _batch_remove_selected(self):
+        sel = self.batch_tree.selection()
+        if not sel:
+            return
+        idxs = sorted([int(iid) - 1 for iid in sel], reverse=True)
+        for i in idxs:
+            if 0 <= i < len(self.batch_jobs):
+                self.batch_jobs.pop(i)
+        self._batch_refresh_view()
+
+    def _batch_clear(self):
+        if not self.batch_jobs:
+            return
+        if not messagebox.askyesno("Queue leeren", "Alle Batch-Jobs entfernen?"):
+            return
+        self.batch_jobs = []
+        self._batch_refresh_view()
+
+    # ----- UI build -----
+    def _build_ui(self):
+        main = ttk.Frame(self, padding=12)
+        main.pack(fill="both", expand=True)
+
+        lf_mode = ttk.LabelFrame(main, text="1. Analyse-Modus", padding=10)
+        lf_mode.pack(fill="x", pady=(0, 10))
+        ttk.Radiobutton(lf_mode, text="Nur zählen", variable=self.run_mode, value="count_only").grid(row=0, column=0, sticky="w", padx=6)
+        ttk.Radiobutton(lf_mode, text="Distanzen (CSV)", variable=self.run_mode, value="distance_csv").grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Radiobutton(lf_mode, text="Distanzen + Bilder", variable=self.run_mode, value="distance_with_images").grid(row=0, column=2, sticky="w", padx=6)
+        ttk.Radiobutton(lf_mode, text="Batch (Queue)", variable=self.run_mode, value="batch").grid(row=0, column=3, sticky="w", padx=6)
+
+        lf_files = ttk.LabelFrame(main, text="2. Dateien auswählen", padding=10)
+        lf_files.pack(fill="x", pady=(0, 10))
+
+        self.frame_single = ttk.Frame(lf_files)
+        self.frame_single.pack(fill="x")
+
+        self.lbl_single_info = ttk.Label(self.frame_single, text="", foreground="#0055d4")
+        self.lbl_single_info.grid(row=0, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6))
+
+        self.w_dapi = self._file_row(self.frame_single, 1, "DAPI:", self.v_dapi, self._pick_dapi)
+        self.w_outer = self._file_row(self.frame_single, 2, "Outer:", self.v_outer, self._pick_outer)
+        self.w_inner = self._file_row(self.frame_single, 3, "Inner:", self.v_inner, self._pick_inner)
+        self.w_parent = self._file_row(self.frame_single, 4, "Output Ordner:", self.v_parent_out, self._pick_parent_out)
+
+        self.frame_batch = ttk.Frame(lf_files)
+        self.frame_batch.pack(fill="x", pady=(10, 0))
+
+        ttk.Separator(self.frame_batch, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Label(
+            self.frame_batch,
+            text="Batch-Queue: Auswahl oben → 'Schnitt hinzufügen' → Run arbeitet alle Jobs nacheinander ab.",
+            foreground="#0055d4",
+            font=("", 9, "bold"),
+        ).pack(anchor="w", padx=6, pady=(0, 6))
+
+        btn_row = ttk.Frame(self.frame_batch)
+        btn_row.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Button(btn_row, text="Schnitt hinzufügen", command=self._batch_add_current_selection).pack(side="left")
+        ttk.Button(btn_row, text="Auswahl entfernen", command=self._batch_remove_selected).pack(side="left", padx=8)
+        ttk.Button(btn_row, text="Queue leeren", command=self._batch_clear).pack(side="left")
+        self.lbl_batch_count = ttk.Label(btn_row, text="Jobs in Queue: 0")
+        self.lbl_batch_count.pack(side="left", padx=16)
+
+        cols = ("idx", "px", "dapi", "outer", "inner", "out")
+        self.batch_tree = ttk.Treeview(self.frame_batch, columns=cols, show="headings", height=6, selectmode="extended")
+        self.batch_tree.pack(fill="x", padx=6, pady=(0, 6))
+
+        self.batch_tree.heading("idx", text="#")
+        self.batch_tree.heading("px", text="px/µm")
+        self.batch_tree.heading("dapi", text="DAPI")
+        self.batch_tree.heading("outer", text="Outer")
+        self.batch_tree.heading("inner", text="Inner")
+        self.batch_tree.heading("out", text="Output-Ordner")
+
+        self.batch_tree.column("idx", width=40, anchor="center")
+        self.batch_tree.column("px", width=70, anchor="center")
+        self.batch_tree.column("dapi", width=260)
+        self.batch_tree.column("outer", width=200)
+        self.batch_tree.column("inner", width=200)
+        self.batch_tree.column("out", width=380)
+
+        # Tabs
+        nb = ttk.Notebook(main)
+        nb.pack(fill="both", expand=True, pady=(0, 10))
+
+        tab_core = ttk.Frame(nb, padding=10)
+        tab_out = ttk.Frame(nb, padding=10)
+        tab_dbg = ttk.Frame(nb, padding=10)
+        nb.add(tab_core, text="⚙️ Core")
+        nb.add(tab_out, text="🖼️ Outputs")
+        nb.add(tab_dbg, text="🛠️ Debug")
+
+        # Core
+        lf_scale = ttk.LabelFrame(tab_core, text="Skalierung & Klassen", padding=8)
+        lf_scale.pack(fill="x", pady=6)
+        self._entry_row(lf_scale, 0, "Pixel pro µm:", self.v_px_per_um)
+        self._entry_row(lf_scale, 1, "Zonen-Grenzen (µm):", self.v_thresholds)
+        ttk.Checkbutton(lf_scale, text="Skeletonize boundary", variable=self.v_skeletonize).grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=4)
+
+        lf_seg = ttk.LabelFrame(tab_core, text="Segmentation", padding=8)
+        lf_seg.pack(fill="x", pady=6)
+        self._entry_row(lf_seg, 0, "Min size (px²):", self.v_min_size)
+        self._entry_row(lf_seg, 1, "Max size (px²):", self.v_max_size)
+        self._entry_row(lf_seg, 2, "Gaussian sigma:", self.v_sigma)
+        self._entry_row(lf_seg, 3, "Local radius (px):", self.v_radius)
+        ttk.Checkbutton(lf_seg, text="Exclude edge nuclei", variable=self.v_exclude_edge).grid(row=4, column=0, columnspan=2, sticky="w", padx=6, pady=4)
+
+        lf_ws = ttk.LabelFrame(tab_core, text="Watershed", padding=8)
+        lf_ws.pack(fill="x", pady=6)
+        ttk.Checkbutton(lf_ws, text="Enable watershed", variable=self.v_watershed).grid(row=0, column=0, columnspan=2, sticky="w", padx=6, pady=4)
+        self._entry_row(lf_ws, 1, "Watershed h (px):", self.v_watershed_h)
+
+        # Outputs
+        lf_out = ttk.LabelFrame(tab_out, text="Image outputs (ONLY these are saved)", padding=8)
+        lf_out.pack(fill="x", pady=6)
+
+        ttk.Label(lf_out, text="PNG compression (0..9):").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        ttk.Entry(lf_out, textvariable=self.v_png_comp, width=6).grid(row=0, column=1, sticky="w", padx=6, pady=4)
+
+        ttk.Label(lf_out, text="Max filename stem length:").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        ttk.Entry(lf_out, textvariable=self.v_max_base_len, width=6).grid(row=1, column=1, sticky="w", padx=6, pady=4)
+
+        ttk.Checkbutton(lf_out, text="Save classes_filled (distance)", variable=self.v_save_classes).grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=4)
+        ttk.Checkbutton(lf_out, text="Save distance_zones (distance)", variable=self.v_save_zones).grid(row=3, column=0, columnspan=2, sticky="w", padx=6, pady=4)
+        ttk.Checkbutton(lf_out, text="Save heatmap + tiles CSV (fixed 0..25)", variable=self.v_save_local_density).grid(row=4, column=0, columnspan=2, sticky="w", padx=6, pady=4)
+
+        ttk.Label(lf_out, text="Heatmap cell size (µm):").grid(row=5, column=0, sticky="w", padx=6, pady=4)
+        ttk.Entry(lf_out, textvariable=self.v_density_cell_um, width=10).grid(row=5, column=1, sticky="w", padx=6, pady=4)
+
+        ttk.Label(lf_out, text="Heatmap colormap:").grid(row=6, column=0, sticky="w", padx=6, pady=4)
+        ttk.Combobox(lf_out, textvariable=self.v_density_colormap, values=["turbo", "jet"], state="readonly", width=10).grid(row=6, column=1, sticky="w", padx=6, pady=4)
+
+        ttk.Checkbutton(lf_out, text="Embed colorbar into heatmap", variable=self.v_density_embed).grid(row=7, column=0, columnspan=2, sticky="w", padx=6, pady=4)
+
+        # Debug
+        ttk.Checkbutton(tab_dbg, text="Save debug boundary masks", variable=self.v_dbg_bounds).pack(anchor="w", padx=6, pady=4)
+        ttk.Checkbutton(tab_dbg, text="Save debug nuclei mask", variable=self.v_dbg_nuclei).pack(anchor="w", padx=6, pady=4)
+        ttk.Checkbutton(tab_dbg, text="Save debug heatmap area mask", variable=self.v_density_mask_debug).pack(anchor="w", padx=6, pady=4)
+
+        # Bottom
+        bottom = ttk.Frame(main)
+        bottom.pack(fill="both", expand=True)
+
+        btns = ttk.Frame(bottom)
+        btns.pack(fill="x", pady=(0, 8))
+
+        self.btn_run = ttk.Button(btns, text="▶ Run", command=self._run_clicked)
+        self.btn_run.pack(side="left")
+
+        self.btn_abort = ttk.Button(btns, text="Abort", command=self._abort_clicked, state="disabled")
+        self.btn_abort.pack(side="left", padx=8)
+
+        ttk.Label(btns, textvariable=self.v_elapsed).pack(side="left", padx=12)
+
+        ttk.Button(btns, text="Quit", command=self.destroy).pack(side="right")
+
+        self.txt_log = tk.Text(bottom, height=10, wrap="word", bg="#f4f4f4")
+        self.txt_log.pack(fill="both", expand=True)
+
+        self._log(f"Version: {DAPI_ANALYZE_GUI_VERSION}")
+        self._batch_refresh_view()
+
+    def _apply_mode_rules(self):
+        mode = str(self.run_mode.get())
+        is_count_only = (mode == "count_only")
+        is_distance_csv = (mode == "distance_csv")
+        is_batch = (mode == "batch")
+
+        if is_batch:
+            self.frame_batch.pack(fill="x", pady=(10, 0))
+            self.lbl_single_info.configure(text="Batch: Auswahl oben → 'Schnitt hinzufügen' → Run arbeitet Queue ab.")
+            self._set_row_enabled(self.w_outer, True)
+            self._set_row_enabled(self.w_inner, True)
+        else:
+            self.frame_batch.pack_forget()
+            if is_count_only:
+                self._set_row_enabled(self.w_outer, False)
+                self._set_row_enabled(self.w_inner, False)
+                self.lbl_single_info.configure(text="Count-only: nur DAPI + Output nötig.")
+            else:
+                self._set_row_enabled(self.w_outer, True)
+                self._set_row_enabled(self.w_inner, True)
+                self.lbl_single_info.configure(text="Distance: DAPI + Outer + Inner + Output wählen.")
+
+        if is_distance_csv:
+            # no images in CSV-only
+            self.v_save_classes.set(False)
+            self.v_save_zones.set(False)
+            self.v_save_local_density.set(False)
+
+    # pickers
+    def _pick_dapi(self):
+        p = filedialog.askopenfilename(title="Select DAPI image")
+        if p:
+            self.v_dapi.set(p)
+
+    def _pick_outer(self):
+        p = filedialog.askopenfilename(title="Select OUTER boundary image")
+        if p:
+            self.v_outer.set(p)
+
+    def _pick_inner(self):
+        p = filedialog.askopenfilename(title="Select INNER boundary image")
+        if p:
+            self.v_inner.set(p)
+
+    def _pick_parent_out(self):
+        p = filedialog.askdirectory(title="Select output folder")
+        if p:
+            self.v_parent_out.set(p)
+
+    def _abort_clicked(self):
+        self.abort_event.set()
+        self._log("Abort requested...")
+
+    def _collect_params(self) -> Dict[str, Any]:
+        mode = str(self.run_mode.get())
+        do_distances = mode in ("distance_csv", "distance_with_images", "batch")
+
+        px_per_um = float(self.v_px_per_um.get())
+        if px_per_um <= 0:
+            raise ValueError("Pixel pro µm muss > 0 sein.")
+
+        thresholds_um = parse_thresholds_list(self.v_thresholds.get())
+
+        png_comp = int(float(self.v_png_comp.get()))
+        if png_comp < 0 or png_comp > 9:
+            raise ValueError("PNG Kompression muss 0..9 sein.")
+
+        max_base_len = int(float(self.v_max_base_len.get()))
+        if max_base_len < 10:
+            raise ValueError("Max filename stem length sollte >= 10 sein.")
+
+        density_cell_um = float(self.v_density_cell_um.get())
+        if density_cell_um <= 0:
+            raise ValueError("Heatmap cell size muss > 0 sein.")
+
+        density_colormap = str(self.v_density_colormap.get()).strip().lower()
+        if density_colormap not in ("turbo", "jet"):
+            raise ValueError("Colormap muss turbo oder jet sein.")
+
+        params: Dict[str, Any] = {
+            "px_per_um": px_per_um,
+            "thresholds_um": thresholds_um,
+
+            "min_size_px2": int(float(self.v_min_size.get())),
+            "max_size_px2": int(float(self.v_max_size.get())),
+            "gaussian_sigma": float(self.v_sigma.get()),
+            "local_radius_px": int(float(self.v_radius.get())),
+
+            "do_watershed": bool(self.v_watershed.get()),
+            "watershed_h_px": float(self.v_watershed_h.get()),
+            "exclude_edge": bool(self.v_exclude_edge.get()),
+            "skeletonize_boundary": bool(self.v_skeletonize.get()),
+
+            # outputs (ONLY)
+            "save_classes_filled": bool(self.v_save_classes.get()),
+            "save_distance_zones_image": bool(self.v_save_zones.get()),
+            "save_local_density_map": bool(self.v_save_local_density.get()),
+
+            "density_cell_um": density_cell_um,
+            "density_colormap": density_colormap,
+            "density_show_colorbar": bool(DEFAULTS["density_show_colorbar"]),
+            "density_embed_colorbar": bool(self.v_density_embed.get()),
+            "density_colorbar_side": str(DEFAULTS["density_colorbar_side"]),
+            "density_colorbar_width": int(DEFAULTS["density_colorbar_width"]),
+            "density_colorbar_padding": int(DEFAULTS["density_colorbar_padding"]),
+            "density_excluded_gray": int(DEFAULTS["density_excluded_gray"]),
+
+            "density_use_ring_if_available": bool(DEFAULTS["density_use_ring_if_available"]),
+            "density_use_included_only": bool(DEFAULTS["density_use_included_only"]),
+            "density_tissue_mask_from_nuclei": bool(DEFAULTS["density_tissue_mask_from_nuclei"]),
+            "density_tissue_mask_ds": int(DEFAULTS["density_tissue_mask_ds"]),
+            "density_tissue_dilate_um": float(DEFAULTS["density_tissue_dilate_um"]),
+            "density_tissue_close_um": float(DEFAULTS["density_tissue_close_um"]),
+            "save_density_mask_debug": bool(self.v_density_mask_debug.get()),
+
+            "compute_zone_area_for_density": bool(DEFAULTS["compute_zone_area_for_density"]),
+            "density_area_downsample_factor": int(DEFAULTS["density_area_downsample_factor"]),
+            "compute_distance_subzones": bool(DEFAULTS["compute_distance_subzones"]),
+            "zones_overlap_darken_factor": float(DEFAULTS["zones_overlap_darken_factor"]),
+            "zones_downsample_factor": int(DEFAULTS["zones_downsample_factor"]),
+            "zones_overlay_boundaries_blue": bool(DEFAULTS["zones_overlay_boundaries_blue"]),
+
+            "save_debug_boundary_masks": bool(self.v_dbg_bounds.get()),
+            "save_debug_nuclei_mask": bool(self.v_dbg_nuclei.get()),
+
+            "png_compression": png_comp,
+            "max_basename_len": max_base_len,
+
+            "csv_sep": DEFAULTS["csv_sep"],
+            "csv_decimal": DEFAULTS["csv_decimal"],
+            "summary_round_decimals": int(DEFAULTS["summary_round_decimals"]),
+
+            "abort_check_every_n_objects": int(DEFAULTS["abort_check_every_n_objects"]),
+            "remove_line_artifacts": bool(DEFAULTS["remove_line_artifacts"]),
+            "line_artifact_max_h_px": int(DEFAULTS["line_artifact_max_h_px"]),
+            "line_artifact_min_w_px": int(DEFAULTS["line_artifact_min_w_px"]),
+            "line_artifact_min_aspect": float(DEFAULTS["line_artifact_min_aspect"]),
+
+            "save_local_density_tiles_csv": bool(DEFAULTS["save_local_density_tiles_csv"]),
+            "heatmap_fixed_count_vmin": float(DEFAULTS["heatmap_fixed_count_vmin"]),
+            "heatmap_fixed_count_vmax": float(DEFAULTS["heatmap_fixed_count_vmax"]),
+        }
+
+        # mode safety
+        if mode == "count_only":
+            params["save_classes_filled"] = False
+            params["save_distance_zones_image"] = False
+
+        if mode == "distance_csv":
+            params["save_classes_filled"] = False
+            params["save_distance_zones_image"] = False
+            params["save_local_density_map"] = False
+
+        return params
+
+    def _run_clicked(self):
+        self.abort_event.clear()
+
+        mode = str(self.run_mode.get())
+        is_batch = (mode == "batch")
+        do_distances = mode in ("distance_csv", "distance_with_images")
+
+        dapi_path = str(self.v_dapi.get()).strip()
+        outer_path = str(self.v_outer.get()).strip()
+        inner_path = str(self.v_inner.get()).strip()
+        parent_out = str(self.v_parent_out.get()).strip()
+
+        if not is_batch:
+            if not dapi_path:
+                return messagebox.showerror("Fehlende Angabe", "Bitte DAPI auswählen.")
+            if do_distances and (not outer_path or not inner_path):
+                return messagebox.showerror("Fehlende Angabe", "Für Distanzmodus Outer+Inner auswählen.")
+            if not parent_out:
+                return messagebox.showerror("Fehlende Angabe", "Bitte Output-Ordner auswählen.")
+        else:
+            if not self.batch_jobs:
+                return messagebox.showerror("Batch-Queue leer", "Bitte erst Jobs mit 'Schnitt hinzufügen' hinzufügen.")
+
+        try:
+            params = self._collect_params()
+        except Exception as e:
+            return messagebox.showerror("Ungültige Parameter", str(e))
+
+        self.btn_run.configure(state="disabled")
+        self.btn_abort.configure(state="normal")
+        self.v_elapsed.set("Dauer: 00:00:00")
+        self._timer_start()
+        self._log("Starte...")
+
+        def worker():
+            out_dir = None
+            try:
+                if is_batch:
+                    jobs = list(self.batch_jobs)  # snapshot
+                    self._post_log(f"{len(jobs)} Jobs in Queue. Starte Batch...")
+
+                    for idx, job in enumerate(jobs, start=1):
+                        abort_check(self.abort_event)
+
+                        curr_dapi = job.get("dapi", "")
+                        curr_outer = job.get("outer", "")
+                        curr_inner = job.get("inner", "")
+                        curr_parent_out = job.get("parent_out", "")
+                        px_job_str = job.get("px_per_um", "")
+
+                        self._post_log(f"\n--- Job {idx}/{len(jobs)}: {os.path.basename(curr_dapi)} ---")
+
+                        if not curr_dapi or not os.path.isfile(curr_dapi):
+                            self._post_log("FEHLER: DAPI Pfad ungültig. Überspringe Job.")
+                            continue
+                        if not curr_parent_out or not os.path.isdir(curr_parent_out):
+                            self._post_log("FEHLER: Output-Ordner ungültig. Überspringe Job.")
+                            continue
+
+                        try:
+                            px_job = float(px_job_str)
+                        except Exception:
+                            self._post_log("FEHLER: px/µm im Job ungültig. Überspringe Job.")
+                            continue
+                        if px_job <= 0:
+                            self._post_log("FEHLER: px/µm <= 0. Überspringe Job.")
+                            continue
+
+                        has_bounds = bool(curr_outer) and bool(curr_inner) and os.path.isfile(curr_outer) and os.path.isfile(curr_inner)
+                        if not has_bounds:
+                            self._post_log("WARNUNG: Outer/Inner fehlen -> Job läuft als Count-only.")
+
+                        run_out_dir, base_safe, base_orig = make_run_output_dir(
+                            curr_parent_out,
+                            curr_dapi,
+                            int(params.get("max_basename_len", 60)),
+                        )
+                        save_run_artifacts(run_out_dir)
+
+                        job_params = dict(params)
+                        job_params["px_per_um"] = px_job  # IMPORTANT: image-specific scale
+
+                        analyze_one(
+                            dapi_path=curr_dapi,
+                            out_dir=run_out_dir,
+                            base_safe=base_safe,
+                            base_original=base_orig,
+                            params=job_params,
+                            do_distances=has_bounds,
+                            outer_path=curr_outer if has_bounds else None,
+                            inner_path=curr_inner if has_bounds else None,
+                            log_fn=self._post_log,
+                            abort_event=self.abort_event,
+                        )
+
+                        gc.collect()
+
+                    self._post_log("\nBatch fertig.")
+                    self._post_done(jobs[-1].get("parent_out", "") if jobs else "")
+                    return
+
+                # single run
+                out_dir, base_safe, base_orig = make_run_output_dir(
+                    parent_out,
+                    dapi_path,
+                    int(params.get("max_basename_len", 60)),
+                )
+                save_run_artifacts(out_dir)
+                self._post_log(f"Output: {out_dir}")
+
+                analyze_one(
+                    dapi_path=dapi_path,
+                    out_dir=out_dir,
+                    base_safe=base_safe,
+                    base_original=base_orig,
+                    params=params,
+                    do_distances=do_distances,
+                    outer_path=outer_path if do_distances else None,
+                    inner_path=inner_path if do_distances else None,
+                    log_fn=self._post_log,
+                    abort_event=self.abort_event,
+                )
+
+                gc.collect()
+                self._post_done(out_dir)
+
+            except AbortRequested:
+                self._post_error("Abgebrochen.")
+            except Exception:
+                err = traceback.format_exc()
+                if out_dir:
+                    try:
+                        with open(os.path.join(out_dir, "error_traceback.txt"), "w", encoding="utf-8") as f:
+                            f.write(err)
+                    except Exception:
+                        pass
+                self._post_log(err)
+                self._post_error("Kritischer Fehler. Siehe Log / error_traceback.txt.")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+if __name__ == "__main__":
+    app = DapiAnalyzeApp()
+    app.mainloop()
