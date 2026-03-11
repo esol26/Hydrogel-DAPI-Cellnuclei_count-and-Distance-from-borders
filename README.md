@@ -484,13 +484,6 @@ The toolset was created for and applied in a **Bachelor's thesis** at the **Hoch
 
 The scientific methodology (Phansalkar thresholding, watershed segmentation, distance-based classification) is based on established bioimage analysis techniques.
 
----
-
-## License
-
-*Add your license here (e.g. MIT, GPL-3.0, Apache-2.0).*
-
----
 
 ## Acknowledgments
 
